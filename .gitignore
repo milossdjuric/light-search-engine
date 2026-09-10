@@ -1,0 +1,30 @@
+# Build artifacts
+search-server
+bin/
+
+# Runtime data (WAL, segments, manifests)
+data/
+
+# Logs
+logs/
+
+# Python virtual environment
+bench/.venv/
+
+# Generated result files (except checked-in baselines)
+bench/sweep_n*_results.json
+bench/sweep_segments_results.md
+bench/engine_results.json
+bench/beir_results.json
+
+# Go profiling output
+*.prof
+*.pprof
+
+# Agent-specific memory (not part of the codebase)
+memory/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
