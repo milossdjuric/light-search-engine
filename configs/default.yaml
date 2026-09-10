@@ -1,0 +1,55 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  mode: "shard"
+
+storage:
+  path: "data/manifest.json"
+  data_dir: "data"
+
+index:
+  mem_threshold_mb: 512
+  max_buffer_docs: 100000
+  num_shards: 1
+  bm25_k1: 1.2
+  bm25_b: 0.75
+  merge_on_startup: false
+  segments_per_tier: 15
+  max_merge_at_once: 10
+  max_merge_size_mb: 256
+  merge_rate_limit_mbps: 80
+  segment_compression: ""   # "" | "lz4" (recommended) | "zstd" (legacy)
+  bloom_fp_rate: 0.01        # 0 = disabled
+  stopwords:
+    enabled: false            # false = better recall for natural-language queries (MSMARCO/BEIR)
+    language: "en"            # bbalet/stopwords language code
+  stemming:
+    enabled: false
+    language: "english"
+
+search:
+  global_fusion: "score"
+  default_top_k: 10
+  query_cache_size: 1000     # 0 = disabled
+
+logging:
+  level: "info"
+  format: "text"
+
+object_store:
+  # driver: "local" (default) or "s3".
+  # "local" stores segments and vectors under storage.data_dir.
+  # "s3"    streams segment files to AWS S3 and caches them locally.
+  driver: "local"
+
+  # s3: only used when driver = "s3".
+  s3:
+    bucket: ""               # required — e.g. "my-search-segments"
+    region: "us-east-1"
+    key_prefix: ""           # optional — e.g. "prod/" to namespace keys
+    endpoint: ""             # override for LocalStack/MinIO: "http://localhost:4566"
+
+  # cache: local LRU disk cache for downloaded S3 objects.
+  cache:
+    dir: "data/cache"        # cache root directory
+    max_gb: 10               # evict LRU entries when cache exceeds this size

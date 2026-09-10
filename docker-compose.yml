@@ -1,0 +1,45 @@
+version: "3.9"
+
+# Single-node deployment: 1 coordinator + 1 shard node.
+# For a 3-shard cluster see docker-compose.cluster.yml.
+
+services:
+  shard0:
+    build: .
+    ports:
+      - "8081:8080"
+      - "9090:9090"
+    volumes:
+      - shard0_data:/app/data
+    environment:
+      - SEARCH_SERVER_MODE=shard
+      - SEARCH_CLUSTER_NODE_ID=shard0
+      - SEARCH_CLUSTER_LOCAL_SHARDS=0,1,2,3
+      - SEARCH_CLUSTER_TOTAL_SHARDS=4
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  coordinator:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - SEARCH_SERVER_MODE=coordinator
+      - SEARCH_CLUSTER_BOOTSTRAP=shard0:8080
+      - SEARCH_CLUSTER_TOTAL_SHARDS=4
+    restart: unless-stopped
+    depends_on:
+      shard0:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  shard0_data:

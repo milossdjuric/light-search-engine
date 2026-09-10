@@ -1,0 +1,9 @@
+# Synonym groups for query-time expansion.
+# One group per line; terms separated by commas.
+# Applied at query time only — NOT at index time.
+# Lines starting with '#' and empty lines are ignored.
+
+# Example groups:
+car,automobile,vehicle,auto
+fast,quick,rapid,speedy
+search,find,query,lookup

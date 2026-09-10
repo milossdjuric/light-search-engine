@@ -1,0 +1,78 @@
+version: "3.9"
+
+# 3 shard nodes + 1 coordinator.
+# Routing: shard1 owns shards [0,1,2,3], shard2 owns [4,5,6,7], shard3 owns [8,9,10,11].
+# Total shards: 12. All client traffic goes to the coordinator on :8080.
+
+x-shard-base: &shard-base
+  build: .
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+
+services:
+  shard1:
+    <<: *shard-base
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+    volumes:
+      - shard1_data:/app/data
+    environment:
+      - SEARCH_SERVER_MODE=shard
+      - SEARCH_CLUSTER_NODE_ID=shard1
+      - SEARCH_CLUSTER_LOCAL_SHARDS=0,1,2,3
+      - SEARCH_CLUSTER_TOTAL_SHARDS=12
+      - SEARCH_CLUSTER_GRPC_ADDR=shard1:9090
+
+  shard2:
+    <<: *shard-base
+    ports:
+      - "8082:8080"
+      - "9092:9090"
+    volumes:
+      - shard2_data:/app/data
+    environment:
+      - SEARCH_SERVER_MODE=shard
+      - SEARCH_CLUSTER_NODE_ID=shard2
+      - SEARCH_CLUSTER_LOCAL_SHARDS=4,5,6,7
+      - SEARCH_CLUSTER_TOTAL_SHARDS=12
+      - SEARCH_CLUSTER_GRPC_ADDR=shard2:9090
+
+  shard3:
+    <<: *shard-base
+    ports:
+      - "8083:8080"
+      - "9093:9090"
+    volumes:
+      - shard3_data:/app/data
+    environment:
+      - SEARCH_SERVER_MODE=shard
+      - SEARCH_CLUSTER_NODE_ID=shard3
+      - SEARCH_CLUSTER_LOCAL_SHARDS=8,9,10,11
+      - SEARCH_CLUSTER_TOTAL_SHARDS=12
+      - SEARCH_CLUSTER_GRPC_ADDR=shard3:9090
+
+  coordinator:
+    <<: *shard-base
+    ports:
+      - "8080:8080"
+    depends_on:
+      shard1:
+        condition: service_healthy
+      shard2:
+        condition: service_healthy
+      shard3:
+        condition: service_healthy
+    environment:
+      - SEARCH_SERVER_MODE=coordinator
+      - SEARCH_CLUSTER_TOTAL_SHARDS=12
+      - SEARCH_CLUSTER_BOOTSTRAP=shard1:8080,shard2:8080,shard3:8080
+
+volumes:
+  shard1_data:
+  shard2_data:
+  shard3_data:

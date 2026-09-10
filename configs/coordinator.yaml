@@ -1,0 +1,27 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  mode: "coordinator"
+
+storage:
+  path: "data/coordinator/manifest.json"
+  data_dir: "data/coordinator"
+
+search:
+  global_fusion: "score"
+  default_top_k: 10
+  query_cache_size: 1000
+
+cluster:
+  node_id: "coordinator"
+  total_shards: 4
+  local_shards: []
+  bootstrap_addrs:
+    - "localhost:8081"
+
+logging:
+  level: "info"
+  format: "text"
+
+object_store:
+  driver: "local"

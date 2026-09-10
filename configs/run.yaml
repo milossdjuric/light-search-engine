@@ -1,0 +1,45 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  mode: "shard"
+
+storage:
+  path: "data/manifest.json"
+  data_dir: "data"
+
+index:
+  num_shards: 1                  # MUST match existing data; changing this requires full re-index
+  mem_threshold_mb: 512
+  max_buffer_docs: 100000
+  buffer_pool_size: 4
+  bm25_k1: 1.2
+  bm25_b: 0.75
+  segments_per_tier: 5
+  max_merge_at_once: 10
+  max_merge_size_mb: 2048
+  merge_rate_limit_mbps: 400
+  merge_on_startup: false
+  startup_merge_target: 2
+  warmup_on_startup: true
+  warmup_mode: "full"
+  warmup_tier_threshold_mb: 1000
+  warmup_top_terms: 1000
+  segment_compression: ""
+  bloom_fp_rate: 0.01
+  stopwords:
+    enabled: false
+  stemming:
+    enabled: false
+
+search:
+  global_fusion: "score"
+  default_top_k: 10
+  query_cache_size: 1000
+  doc_cache_size: 50000
+
+logging:
+  level: "info"
+  format: "text"
+
+object_store:
+  driver: "local"
