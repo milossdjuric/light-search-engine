@@ -1,0 +1,23 @@
+{
+  "scidocs": {
+    "description": "Scientific paper retrieval",
+    "approx_docs": 25657,
+    "bm25_baseline": 0.158,
+    "ours_ndcg10": 0.15055074632779833,
+    "ours_mrr10": 0.27009285714285713,
+    "ours_recall100": 0.34775,
+    "ours_p50_ms": 48.21190099755768,
+    "ours_p95_ms": 111.44223390292605,
+    "ours_qps": 65.6205197419628,
+    "ours_total_queries": 1000,
+    "ours_errors": 0,
+    "es_ndcg10": 0.14924240470057232,
+    "es_mrr10": 0.2667940476190476,
+    "es_recall100": 0.3478333333333334,
+    "es_p50_ms": 92.66370951081626,
+    "es_p95_ms": 195.28621613426364,
+    "es_qps": 35.715957032293595,
+    "es_total_queries": 1000,
+    "es_errors": 0
+  }
+}

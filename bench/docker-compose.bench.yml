@@ -1,0 +1,159 @@
+# Benchmark docker-compose: runs all search systems on the same machine
+# for a fair same-hardware comparison on the MSMARCO corpus.
+#
+# Usage:
+#   docker compose -f bench/docker-compose.bench.yml up -d
+#   docker compose -f bench/docker-compose.bench.yml run --rm runner
+#   docker compose -f bench/docker-compose.bench.yml down -v
+#
+# Pass extra args to run_bench.py:
+#   docker compose -f bench/docker-compose.bench.yml run --rm runner --systems search-engine --limit 10000
+
+networks:
+  bench:
+    driver: bridge
+
+volumes:
+  search-engine-data:
+  elasticsearch-data:
+  meilisearch-data:
+  typesense-data:
+  quickwit-data:
+  hf-cache:
+
+services:
+
+  # ── Benchmark runner ─────────────────────────────────────────────────────────
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.bench
+    entrypoint: ["python3", "run_bench.py"]
+    environment:
+      - SEARCH_ENGINE_URL=http://search-engine:8080
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - MEILISEARCH_URL=http://meilisearch:7700
+      - TYPESENSE_URL=http://typesense:8108
+      - QUICKWIT_URL=http://quickwit:7280
+    volumes:
+      - ./bench_results.json:/bench/bench_results.json
+      - hf-cache:/root/.cache/huggingface
+    networks:
+      - bench
+    profiles:
+      - runner
+    depends_on:
+      - search-engine
+      - elasticsearch
+      - meilisearch
+      - typesense
+      - quickwit
+
+  # ── Our search engine ────────────────────────────────────────────────────────
+  search-engine:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8080"
+    volumes:
+      - search-engine-data:/app/data
+      - ../configs/bench.yaml:/app/configs/bench.yaml:ro
+    command: ["-config", "/app/configs/bench.yaml"]
+    environment:
+      - GOGC=400
+    networks:
+      - bench
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # ── Elasticsearch 8.17.0 ─────────────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    ports:
+      - "9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms4g -Xmx4g
+      - indices.query.bool.max_clause_count=4096
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - bench
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -E '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # ── Meilisearch v1.12.3 ──────────────────────────────────────────────────────
+  meilisearch:
+    image: getmeili/meilisearch:v1.12.3
+    ports:
+      - "7700:7700"
+    environment:
+      - MEILI_NO_ANALYTICS=true
+      - MEILI_MAX_INDEXING_MEMORY=4GiB
+    volumes:
+      - meilisearch-data:/meili_data
+    networks:
+      - bench
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7700/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ── Typesense 27.1 ───────────────────────────────────────────────────────────
+  typesense:
+    image: typesense/typesense:27.1
+    ports:
+      - "8108:8108"
+    command: >
+      --data-dir=/data
+      --api-key=bench-api-key
+      --enable-cors
+    volumes:
+      - typesense-data:/data
+    networks:
+      - bench
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8108/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ── Quickwit 0.8.1 ───────────────────────────────────────────────────────────
+  quickwit:
+    image: quickwit/quickwit:0.8.1
+    ports:
+      - "7280:7280"
+    command: ["run"]
+    environment:
+      - QW_DATA_DIR=/quickwit/qwdata
+      - NO_COLOR=1
+    volumes:
+      - quickwit-data:/quickwit/qwdata
+    networks:
+      - bench
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7280/api/v1/version"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s

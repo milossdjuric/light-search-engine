@@ -1,0 +1,15 @@
+{
+  "scidocs": {
+    "description": "Scientific paper retrieval",
+    "approx_docs": 25657,
+    "bm25_baseline": 0.158,
+    "ndcg10": 0.15055143883752883,
+    "mrr10": 0.26962619047619046,
+    "recall100": 0.34895000000000004,
+    "p50_ms": 76.60836399736581,
+    "p95_ms": 126.46847618816531,
+    "qps": 47.76605865758398,
+    "total_queries": 1000,
+    "errors": 0
+  }
+}
