@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package replication;
+
+option go_package = "search-eval-platform/internal/replication";
+
+// WALReplication streams WAL entries from primary to replicas.
+service WALReplication {
+  rpc StreamWAL(StreamRequest) returns (stream WALEntry);
+}
+
+// StreamRequest carries the replica's highest applied sequence number.
+// The primary will stream all entries with seq > from_seq.
+message StreamRequest {
+  string shard_id = 1;
+  uint64 from_seq = 2;
+}
+
+// WALEntry mirrors the NDJSON WAL format.
+message WALEntry {
+  uint64 seq      = 1;
+  string op       = 2;  // "index" | "delete"
+  string doc_id   = 3;
+  string text     = 4;
+  map<string, string> metadata = 5;
+  int64  ts_unix  = 6;  // Unix nanoseconds
+}
