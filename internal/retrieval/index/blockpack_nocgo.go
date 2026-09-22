@@ -1,10 +1,12 @@
-//go:build !cgo || !amd64
+//go:build !cgo || (!amd64 && !arm64)
 
 package index
 
 // UnpackFOR32Into decodes exactly BlockSize uint32 values from src (written by
 // PackFOR32) into out as uint64. Returns the number of bytes consumed from src.
 // Specialized paths for common bit widths avoid the generic shift loop.
+// Used when cgo is unavailable, or on architectures with neither the AVX2
+// (amd64) nor NEON (arm64) vectorized path.
 func UnpackFOR32Into(src []byte, out []uint64) int {
 	bits := src[0]
 	if bits == 0 {

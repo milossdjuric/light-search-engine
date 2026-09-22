@@ -77,52 +77,69 @@ func (c *Client) breaker(nodeID string) *CircuitBreaker {
 	return cb
 }
 
-// nodeFor returns the primary node, falling back to a replica if the primary
-// circuit breaker is open.
-func (c *Client) nodeFor(shardID int) (*NodeMeta, bool /*degraded*/, error) {
+// nodeFor returns the node to route shardID's request to, plus the
+// breaker's done callback that the caller MUST invoke with the request's
+// success/failure once it completes.
+//
+// Routing is decided via each candidate's Allow(), not a plain IsOpen()
+// read: Allow() is the only method that can transition a breaker from Open
+// to HalfOpen (once its reset timeout has elapsed) and admit a probe. A
+// stale IsOpen() check never does that on its own, so if nodeFor only ever
+// consulted IsOpen() and filtered out any Open primary before a real
+// request could be attempted against it, nothing would ever call Allow()
+// on that breaker again — permanently quarantining a primary even after it
+// recovers.
+func (c *Client) nodeFor(shardID int) (node *NodeMeta, done func(bool), degraded bool, err error) {
 	prim, err := c.ring.Primary(shardID)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	cb := c.breaker(prim.NodeID)
-	if !cb.IsOpen() {
-		return prim, false, nil
+	if allowed, d := c.breaker(prim.NodeID).Allow(); allowed {
+		return prim, d, false, nil
 	}
-	// Primary is open — try a replica.
+	// Primary denied — try a replica.
 	for _, rep := range c.ring.ReplicasForShard(shardID) {
-		if !c.breaker(rep.NodeID).IsOpen() {
+		if allowed, d := c.breaker(rep.NodeID).Allow(); allowed {
 			slog.Warn("client: primary unavailable, using replica",
 				"shard", shardID, "primary", prim.NodeID, "replica", rep.NodeID)
-			return rep, true, nil
+			return rep, d, true, nil
 		}
 	}
-	return nil, true, fmt.Errorf("client: no available node for shard %d", shardID)
+	return nil, nil, true, fmt.Errorf("client: no available node for shard %d", shardID)
 }
 
 // IndexDoc routes a single document to the owning shard.
 func (c *Client) IndexDoc(ctx context.Context, doc types.Document) error {
 	shard := c.shardFor(doc.ID)
-	node, _, err := c.nodeFor(shard)
+	node, done, _, err := c.nodeFor(shard)
 	if err != nil {
 		return err
 	}
 	body, _ := json.Marshal(doc)
-	return c.postJSON(ctx, node, "/index", body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://"+node.HTTPAddr+"/index", bytes.NewReader(body))
+	if err != nil {
+		done(false)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.doWithDone(req, done)
 }
 
 // DeleteDoc routes a delete to the owning shard.
 func (c *Client) DeleteDoc(ctx context.Context, docID string) error {
 	shard := c.shardFor(docID)
-	node, _, err := c.nodeFor(shard)
+	node, done, _, err := c.nodeFor(shard)
 	if err != nil {
 		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
 		"http://"+node.HTTPAddr+"/index/"+url.PathEscape(docID), nil)
 	if err != nil {
+		done(false)
 		return err
 	}
-	return c.doWithBreaker(node, req)
+	return c.doWithDone(req, done)
 }
 
 // searchNodeResult is an intermediate per-node search result.
@@ -268,17 +285,6 @@ func (c *Client) searchNode(
 	return resp.Results, false, nil
 }
 
-func (c *Client) postJSON(ctx context.Context, node *NodeMeta, path string, body []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://"+node.HTTPAddr+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	return c.doWithBreaker(node, req)
-}
-
 func (c *Client) postJSONDecode(ctx context.Context, node *NodeMeta, path string, body []byte, dst interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		"http://"+node.HTTPAddr+path, bytes.NewReader(body))
@@ -298,6 +304,26 @@ func (c *Client) getJSON(ctx context.Context, node *NodeMeta, pathAndQuery strin
 	}
 
 	return c.doDecodeWithBreaker(node, req, dst)
+}
+
+// doWithDone performs req and reports its outcome via done, obtained from a
+// prior CircuitBreaker.Allow() call (nodeFor) — unlike doWithBreaker, it
+// does not call Allow() itself, so a request routed through nodeFor records
+// exactly one breaker outcome instead of two.
+func (c *Client) doWithDone(req *http.Request, done func(bool)) error {
+	resp, err := c.httpCli.Do(req)
+	if err != nil {
+		done(false)
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	ok := resp.StatusCode < 500
+	done(ok)
+	if !ok {
+		return fmt.Errorf("client: node returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (c *Client) doWithBreaker(node *NodeMeta, req *http.Request) error {

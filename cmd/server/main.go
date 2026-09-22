@@ -275,15 +275,29 @@ func runShard(cfg *config.Config) error {
 		}
 	}()
 
-	if err := serveHTTP(cfg, mux); err != nil {
-		return fmt.Errorf("http server: %w", err)
-	}
+	return runShardServeAndClose(
+		func() error { return serveHTTP(cfg, mux) },
+		shards.Close,
+	)
+}
 
-	slog.Info("flushing shards before exit", "shards", cfg.Index.NumShards)
-	if err := shards.Close(); err != nil {
+// runShardServeAndClose runs serve (the HTTP server) and always attempts
+// close (the shard manager's final flush) afterward, regardless of whether
+// serve returned an error. A serve error (e.g. a graceful-shutdown timeout)
+// used to skip close entirely, leaking buffered-but-unflushed documents
+// (especially under wal_durability: async) and the WAL file descriptor.
+func runShardServeAndClose(serve func() error, close func() error) error {
+	serveErr := serve()
+
+	slog.Info("flushing shards before exit")
+	if err := close(); err != nil {
 		slog.Error("shard manager close", "err", err)
 	}
 	slog.Info("shutdown complete")
+
+	if serveErr != nil {
+		return fmt.Errorf("http server: %w", serveErr)
+	}
 	return nil
 }
 

@@ -128,6 +128,10 @@ func (sm *SegmentManager) executeMerge(ctx context.Context, candidates []manifes
 	for _, r := range sm.segRecords {
 		activeIDs[r.SegmentID] = struct{}{}
 	}
+	tombstonesSnapshot := make(map[string]struct{}, len(sm.tombstones))
+	for docID := range sm.tombstones {
+		tombstonesSnapshot[docID] = struct{}{}
+	}
 	sm.mu.RUnlock()
 	for _, c := range candidates {
 		if _, ok := activeIDs[c.SegmentID]; !ok {
@@ -160,6 +164,12 @@ func (sm *SegmentManager) executeMerge(ctx context.Context, candidates []manifes
 		}
 		segsToMerge = append(segsToMerge, seg)
 	}
+	// segsToMerge is built in candidates order, which is not chronological
+	// (SelectMerge sorts by deletion score, forceMerge by size) — reorder it
+	// oldest-to-newest by FlushSeq so MergeSegmentsWithOptions's "highest
+	// index wins" duplicate-docID resolution actually reflects which input
+	// segment holds a doc's most recent content, not merge-candidate order.
+	orderSegmentsByFlushSeq(segsToMerge, candidates)
 	// Merge reads terms in sorted FST order — file positions are mostly
 	// ascending. Switch to sequential mode so the kernel issues aggressive
 	// read-ahead instead of treating each read as an isolated random access.
@@ -201,7 +211,7 @@ func (sm *SegmentManager) executeMerge(ctx context.Context, candidates []manifes
 		os.Remove(tmpPath + ".bloom")
 		os.Remove(strings.TrimSuffix(tmpPath, ".seg") + ".seg.fld")
 	}
-	if err := MergeSegmentsWithOptions(tmpPath, segsToMerge, mergeOpts); err != nil {
+	if err := MergeSegmentsWithOptions(tmpPath, segsToMerge, mergeOpts, tombstonesSnapshot); err != nil {
 		cleanupTmp()
 		return fmt.Errorf("executeMerge MergeSegments: %w", err)
 	}
@@ -251,14 +261,62 @@ func (sm *SegmentManager) executeMerge(ctx context.Context, candidates []manifes
 	if fi, statErr := os.Stat(localOutPath); statErr == nil {
 		outSizeBytes = fi.Size()
 	}
+
+	// Recompute DeletedDocs from the current (not the pre-merge-snapshot)
+	// tombstone set: a doc can be deleted while the merge is running, after
+	// tombstonesSnapshot was taken but before it's excluded from a future
+	// merge. Scanning the merged output against live tombstones now (same
+	// pattern as loadNilSegments) keeps this segment's count accurate instead
+	// of staying stuck at a stale value until the next merge cycle.
+	//
+	// While scanning, also collect tombstones that this merge physically
+	// purged (present in an input segment, absent from the output): a
+	// purged doc can only ever have lived in one segment at a time (it
+	// would have cleared its own tombstone on re-index — see the WAL
+	// replay/re-index fix elsewhere in this package), so once it's gone
+	// from the merge output it's gone shard-wide and the tombstone entry
+	// can be dropped. Leaving it behind would grow sm.tombstones
+	// unboundedly over the shard's lifetime and add redundant scan work
+	// here on every future merge for a doc that's already gone.
+	sm.mu.RLock()
+	var outDeletedDocs int64
+	var purgedTombstones []string
+	for docID := range sm.tombstones {
+		if _, ok := outSeg.docIDToNum[docID]; ok {
+			outDeletedDocs++
+			continue
+		}
+		for _, seg := range segsToMerge {
+			if _, ok := seg.docIDToNum[docID]; ok {
+				purgedTombstones = append(purgedTombstones, docID)
+				break
+			}
+		}
+	}
+	sm.mu.RUnlock()
+
+	if len(purgedTombstones) > 0 {
+		sm.mu.Lock()
+		for _, docID := range purgedTombstones {
+			delete(sm.tombstones, docID)
+		}
+		sm.mu.Unlock()
+		for _, docID := range purgedTombstones {
+			// Best-effort: a leftover manifest tombstone record for an
+			// already-purged doc is harmless (nothing left for it to hide).
+			_ = sm.meta.RemoveTombstone(sm.shardID, docID)
+		}
+	}
+
 	outRec := manifest.SegmentRecord{
-		SegmentID: outID,
-		ShardID:   sm.shardID,
-		Level:     outLevel,
-		DocCount:  outSeg.DocCount(),
-		Path:      outKey, // object-store key
-		FlushSeq:  maxSeq,
-		SizeBytes: outSizeBytes,
+		SegmentID:   outID,
+		ShardID:     sm.shardID,
+		Level:       outLevel,
+		DocCount:    outSeg.DocCount(),
+		DeletedDocs: outDeletedDocs,
+		Path:        outKey, // object-store key
+		FlushSeq:    maxSeq,
+		SizeBytes:   outSizeBytes,
 	}
 
 	// Register output and remove inputs atomically in the manifest.
@@ -342,6 +400,25 @@ func (sm *SegmentManager) startupMerge(ctx context.Context) error {
 	slog.Info("startup merge complete", "shard", sm.shardID,
 		"passes", passes, "segments", remaining, "elapsed", time.Since(t0).Round(time.Millisecond))
 	return nil
+}
+
+// orderSegmentsByFlushSeq reorders segsToMerge in place to ascending
+// FlushSeq of the corresponding entry in candidates. segsToMerge and
+// candidates must be the same length and index-aligned (as executeMerge
+// builds them, one LoadSegment per candidate in order).
+func orderSegmentsByFlushSeq(segsToMerge []*Segment, candidates []manifest.SegmentRecord) {
+	type pair struct {
+		seg      *Segment
+		flushSeq int64
+	}
+	pairs := make([]pair, len(segsToMerge))
+	for i, seg := range segsToMerge {
+		pairs[i] = pair{seg: seg, flushSeq: candidates[i].FlushSeq}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].flushSeq < pairs[j].flushSeq })
+	for i, p := range pairs {
+		segsToMerge[i] = p.seg
+	}
 }
 
 // forceMerge merges until the shard has at most maxSegments segments,

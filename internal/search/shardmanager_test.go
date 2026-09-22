@@ -201,6 +201,35 @@ func TestShardManagerFlushPersistsResults(t *testing.T) {
 	}
 }
 
+// TestShardManagerGetDocTextSkipsNilSegment verifies that GetDocText does
+// not panic when a shard's segment list contains a nil placeholder — which
+// is the normal state of a just-flushed segment until something (a Search
+// call) lazily loads it. GetDocText itself never loads segments, so it must
+// skip nils rather than dereference them.
+func TestShardManagerGetDocTextSkipsNilSegment(t *testing.T) {
+	sm := newTestShardManager(t, 1)
+	ctx := context.Background()
+
+	doc := types.Document{ID: "d1", Text: "hello world"}
+	if err := sm.IndexDoc(ctx, doc); err != nil {
+		t.Fatalf("IndexDoc: %v", err)
+	}
+	if err := sm.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// Deliberately no Search() call here: the flushed segment is still a nil
+	// placeholder at this point.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("GetDocText panicked on nil segment placeholder: %v", r)
+			}
+		}()
+		_, _ = sm.GetDocText("d1")
+	}()
+}
+
 // TestShardManagerPartialFailure validates the new 3-value signature and
 // confirms degraded=false when all shards are healthy.
 func TestShardManagerPartialFailure(t *testing.T) {

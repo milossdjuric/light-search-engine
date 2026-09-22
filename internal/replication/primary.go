@@ -59,11 +59,21 @@ func NewPrimaryReplicator(shardID, walPath string) *PrimaryReplicator {
 }
 
 // Append adds a new WAL entry to the ring buffer and fans out to all replicas.
+//
+// The ring is indexed by the entry's own persistent Seq (not an internal
+// append counter): Seq is assigned by the WAL and keeps counting across
+// process restarts, while a counter that starts at 0 in every new
+// PrimaryReplicator would not — using it as the index would misalign catch-up
+// lookups (streamToReplica reads p.ring[seq%ringBufferSize] using real Seq
+// values) both across restarts and, since Seq starts at 1 rather than 0,
+// even within a single process lifetime.
 func (p *PrimaryReplicator) Append(entry *WALEntry) {
 	p.mu.Lock()
-	idx := p.head % ringBufferSize
+	idx := entry.Seq % ringBufferSize
 	p.ring[idx] = entry
-	p.head++
+	if entry.Seq+1 > p.head {
+		p.head = entry.Seq + 1
+	}
 	p.mu.Unlock()
 
 	p.repMu.RLock()
@@ -139,7 +149,9 @@ func (p *PrimaryReplicator) streamToReplica(
 		startIdx = ringStart
 	}
 	for seq := startIdx; seq < head; seq++ {
+		p.mu.Lock()
 		entry := p.ring[seq%ringBufferSize]
+		p.mu.Unlock()
 		if entry == nil {
 			continue
 		}

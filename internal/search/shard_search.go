@@ -165,7 +165,7 @@ func (sm *SegmentManager) Search(query string, topK int, scorer index.Scorer) ([
 	}
 	results := sm.searchAll(tokens, segs, segRecords, bufIdx, bufferDocIDs, tombstones, tombBloom, fetchK, scorer)
 	if pq.HasFilters() {
-		results = sm.applyQueryFilters(results, pq, segs, bufIdx, topK)
+		results = sm.applyQueryFilters(results, pq, segs, segRecords, bufIdx, bufferDocIDs, topK)
 	}
 	return results, nil
 }
@@ -176,7 +176,9 @@ func (sm *SegmentManager) applyQueryFilters(
 	results []types.ScoredDocument,
 	pq *index.ParsedQuery,
 	segs []*Segment,
+	segRecords []manifest.SegmentRecord,
 	bufIdx *index.InvertedIndex,
+	bufferDocIDs map[string]struct{},
 	topK int,
 ) []types.ScoredDocument {
 	out := results[:0]
@@ -187,7 +189,7 @@ func (sm *SegmentManager) applyQueryFilters(
 		keep := true
 
 		for _, term := range pq.Must {
-			if !sm.docHasTermAnywhere(term, doc.DocID, segs, bufIdx) {
+			if !sm.docHasTermAnywhere(term, doc.DocID, segs, segRecords, bufIdx, bufferDocIDs) {
 				keep = false
 				break
 			}
@@ -197,7 +199,7 @@ func (sm *SegmentManager) applyQueryFilters(
 		}
 
 		for _, term := range pq.Not {
-			if sm.docHasTermAnywhere(term, doc.DocID, segs, bufIdx) {
+			if sm.docHasTermAnywhere(term, doc.DocID, segs, segRecords, bufIdx, bufferDocIDs) {
 				keep = false
 				break
 			}
@@ -226,24 +228,66 @@ func (sm *SegmentManager) applyQueryFilters(
 	return out
 }
 
-// docHasTermAnywhere checks posting lists across all sources (buffer + segments)
-// for the given (term, docID) pair. Because docIDs are globally unique within a
-// shard, only one source will contain the document.
-func (sm *SegmentManager) docHasTermAnywhere(term, docID string, segs []*Segment, bufIdx *index.InvertedIndex) bool {
+// docHasTermAnywhere checks the (term, docID) pair against only the source
+// that currently holds docID's authoritative content: the buffer if docID
+// lives there (bufferDocIDs), otherwise the single most-recently-flushed
+// segment that contains it. A doc updated since its last flush can
+// transiently exist in more than one on-disk segment until the next merge
+// consolidates them (see searchAll's recency handling); scanning every
+// segment here — including stale pre-update copies — would let a Must/Not
+// filter match against content the doc no longer has.
+func (sm *SegmentManager) docHasTermAnywhere(term, docID string, segs []*Segment, segRecords []manifest.SegmentRecord, bufIdx *index.InvertedIndex, bufferDocIDs map[string]struct{}) bool {
 	if bufIdx != nil && bufIdx.HasTerm(term, docID) {
 		return true
 	}
-	for _, seg := range segs {
-		if seg.HasTerm(term, docID) {
-			return true
-		}
+	if _, inBuffer := bufferDocIDs[docID]; inBuffer {
+		// The buffer holds the authoritative copy for this doc — the check
+		// above already covered it, so any segment copy is stale.
+		return false
+	}
+	if seg := mostRecentSegmentFor(docID, segs, segRecords); seg != nil {
+		return seg.HasTerm(term, docID)
 	}
 	return false
 }
 
-// loadDocText returns the raw stored text for docID from any segment that has it.
-// Returns "" if stored fields are disabled or the document is not found.
+// mostRecentSegmentFor returns the segment (from segs, index-aligned with
+// segRecords) that holds docID with the highest FlushSeq — the same
+// "most recent copy wins" rule searchAll applies when merging query results.
+// Returns nil if no segment in segs contains docID.
+func mostRecentSegmentFor(docID string, segs []*Segment, segRecords []manifest.SegmentRecord) *Segment {
+	var best *Segment
+	var bestSeq int64
+	for i, seg := range segs {
+		if seg == nil {
+			continue
+		}
+		if _, ok := seg.docIDToNum[docID]; !ok {
+			continue
+		}
+		var seq int64
+		if i < len(segRecords) {
+			seq = segRecords[i].FlushSeq
+		}
+		if best == nil || seq > bestSeq {
+			best = seg
+			bestSeq = seq
+		}
+	}
+	return best
+}
+
+// loadDocText returns the raw stored text for docID: the in-memory buffer's
+// copy if docID hasn't been flushed yet (the buffer always holds the most
+// recent write), otherwise the first segment that has it. Returns "" if
+// stored fields are disabled or the document is not found anywhere.
 func (sm *SegmentManager) loadDocText(docID string, segs []*Segment) string {
+	sm.mu.RLock()
+	bufText, hasBufText := sm.bufferTexts[docID]
+	sm.mu.RUnlock()
+	if hasBufText {
+		return bufText
+	}
 	for _, seg := range segs {
 		if text, ok := seg.GetText(docID); ok && text != "" {
 			return text

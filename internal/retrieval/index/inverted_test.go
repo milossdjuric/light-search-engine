@@ -79,6 +79,73 @@ func TestPostingIterSkipTo(t *testing.T) {
 	}
 }
 
+// TestIndexBuilderReAddBeforeBuildDoesNotDuplicatePostings verifies that
+// calling Add() twice for the same docID before Build() (an upsert within one
+// flush window) results in the second call's content fully replacing the
+// first's — not both being merged into duplicate postings for the same doc.
+func TestIndexBuilderReAddBeforeBuildDoesNotDuplicatePostings(t *testing.T) {
+	b := index.NewIndexBuilder()
+	defer b.Close()
+
+	b.Add("d1", []string{"hello", "world"})
+	b.Add("d1", []string{"hello", "there"}) // re-added before Build(): last write should win
+
+	idx := b.Build()
+
+	if idx.DocCount() != 1 {
+		t.Fatalf("DocCount: want 1, got %d", idx.DocCount())
+	}
+
+	it := idx.Iterator("hello")
+	if it == nil {
+		t.Fatal("Iterator returned nil for 'hello'")
+	}
+	count := 0
+	for it.Next() {
+		count++
+	}
+	if count != 1 {
+		t.Errorf("'hello' should appear in exactly 1 doc after re-Add, got %d occurrences (duplicate postings for re-indexed doc)", count)
+	}
+
+	// The re-add replaced the doc's content: "world" (only in the first,
+	// superseded Add) must be gone; "there" (from the winning second Add)
+	// must be present.
+	if it2 := idx.Iterator("world"); it2 != nil && it2.Next() {
+		t.Error("term 'world' from the superseded first Add() should not appear in the index")
+	}
+	it3 := idx.Iterator("there")
+	if it3 == nil || !it3.Next() {
+		t.Error("term 'there' from the second (winning) Add() should appear in the index")
+	}
+}
+
+// TestIndexBuilderSnapshotAfterReAddIsRepeatable verifies that Snapshot()
+// (documented as callable "without clearing the builder") can be called a
+// second time after a re-Add() happened before the first call, without
+// panicking or corrupting doc lengths — the superseded-doc compaction must
+// not mutate the builder's own state.
+func TestIndexBuilderSnapshotAfterReAddIsRepeatable(t *testing.T) {
+	b := index.NewIndexBuilder()
+	defer b.Close()
+
+	b.Add("d1", []string{"hello", "world"})
+	b.Add("d1", []string{"hello", "there"}) // re-added before Build(): triggers supersede compaction
+
+	first := b.Snapshot()
+	if first.DocCount() != 1 {
+		t.Fatalf("first Snapshot DocCount: want 1, got %d", first.DocCount())
+	}
+
+	second := b.Snapshot() // must not panic
+	if second.DocCount() != 1 {
+		t.Fatalf("second Snapshot DocCount: want 1, got %d", second.DocCount())
+	}
+	if got, want := second.DocLen("d1"), first.DocLen("d1"); got != want {
+		t.Errorf("second Snapshot DocLen(d1) = %d, want %d (same as first)", got, want)
+	}
+}
+
 func TestMemoryEstimateGrows(t *testing.T) {
 	b := index.NewIndexBuilder()
 	before := b.MemoryEstimate()

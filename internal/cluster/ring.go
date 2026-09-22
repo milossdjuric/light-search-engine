@@ -51,13 +51,18 @@ func (r *Ring) Rebuild(nodes []*NodeMeta) {
 		}
 	}
 
-	// Replicas: all nodes that are NOT primary for a given shard,
-	// in node-list order.
+	// Replicas: nodes that actually declare shard s in their own Shards list
+	// and are not its primary, in node-list order. Being merely "not the
+	// primary" is not enough — a node with no data for shard s at all would
+	// otherwise be handed failover traffic for it.
 	for s := 0; s < r.totalShards; s++ {
 		prim := primary[s]
 		var reps []*NodeMeta
 		for _, n := range nodes {
 			if n == prim {
+				continue
+			}
+			if !nodeOwnsShard(n, s) {
 				continue
 			}
 			reps = append(reps, n)
@@ -70,6 +75,16 @@ func (r *Ring) Rebuild(nodes []*NodeMeta) {
 	r.primary = primary
 	r.replicas = replicas
 	r.mu.Unlock()
+}
+
+// nodeOwnsShard reports whether n declares shardID in its Shards list.
+func nodeOwnsShard(n *NodeMeta, shardID int) bool {
+	for _, s := range n.Shards {
+		if s == shardID {
+			return true
+		}
+	}
+	return false
 }
 
 // Primary returns the primary node for shardID, or an error if unknown.

@@ -853,11 +853,13 @@ func (h *mergeHeap) Pop() interface{} {
 // For duplicate docIDs (from crash-replay), the posting from the highest
 // segIdx is kept.
 func MergeSegments(outPath string, segments []*Segment) error {
-	return MergeSegmentsWithOptions(outPath, segments, SegmentWriteOptions{})
+	return MergeSegmentsWithOptions(outPath, segments, SegmentWriteOptions{}, nil)
 }
 
 // MergeSegmentsWithOptions merges segments with the given write options.
-func MergeSegmentsWithOptions(outPath string, segments []*Segment, opts SegmentWriteOptions) error {
+// tombstones lists docIDs that must be dropped from the merged output
+// entirely (deleted documents); nil/empty means don't drop anything.
+func MergeSegmentsWithOptions(outPath string, segments []*Segment, opts SegmentWriteOptions, tombstones map[string]struct{}) error {
 	if len(segments) == 0 {
 		return errors.New("MergeSegments: no input segments")
 	}
@@ -876,6 +878,9 @@ func MergeSegmentsWithOptions(outPath string, segments []*Segment, opts SegmentW
 	for sIdx, seg := range segments {
 		for i := uint64(0); i < seg.docCount; i++ {
 			strID := seg.docIDs[i]
+			if _, tombstoned := tombstones[strID]; tombstoned {
+				continue
+			}
 			if existing, ok := docMap[strID]; !ok || sIdx > existing.segIdx {
 				docMap[strID] = docMeta{docLen: seg.docLens[i], segIdx: sIdx}
 			}

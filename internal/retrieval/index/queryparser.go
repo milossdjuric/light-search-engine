@@ -71,6 +71,15 @@ func ParseQuery(q string, tok *Tokenizer, synonyms *SynonymMap) *ParsedQuery {
 
 	nextNot := false
 	nextMust := false
+	// lastWordTokens holds the token(s) the most recently processed
+	// Should-bound word (or phrase) maps to — a single word can expand into
+	// several (synonym expansion, or a multi-word phrase) — so AND can
+	// promote all of them to Must, not just one. Tracked by value rather
+	// than by position in pq.Should: if the word's tokens were already
+	// present from an earlier word (appendUniq dedup), it may add nothing
+	// new to Should, but the tokens are still sitting in Should from their
+	// first occurrence and AND must still find and promote them there.
+	var lastWordTokens []string
 
 	for i := 0; i < len(words); {
 		w := words[i]
@@ -85,9 +94,24 @@ func ParseQuery(q string, tok *Tokenizer, synonyms *SynonymMap) *ParsedQuery {
 			phrase = strings.TrimSuffix(phrase, `"`)
 			tokens := tok.Tokenize(phrase)
 			if len(tokens) > 0 {
-				pq.Phrases = append(pq.Phrases, tokens)
-				// Also add phrase tokens to Should so they participate in BM25 scoring.
-				pq.Should = appendUniq(pq.Should, tokens)
+				switch {
+				case nextNot:
+					// A preceding "-"/"NOT" excludes docs containing any of
+					// these words — the same word-level exclusion -term/NOT
+					// term use. Not added to Phrases: that slot is purely an
+					// inclusive substring filter, so an excluded phrase must
+					// never end up positively phrase-matched there.
+					pq.Not = appendUniq(pq.Not, tokens)
+				case nextMust:
+					pq.Phrases = append(pq.Phrases, tokens)
+					lastWordTokens = tokens
+					pq.Must = appendUniq(pq.Must, tokens)
+				default:
+					pq.Phrases = append(pq.Phrases, tokens)
+					// Also add phrase tokens to Should so they participate in BM25 scoring.
+					lastWordTokens = tokens
+					pq.Should = appendUniq(pq.Should, tokens)
+				}
 			}
 			nextNot = false
 			nextMust = false
@@ -100,13 +124,23 @@ func ParseQuery(q string, tok *Tokenizer, synonyms *SynonymMap) *ParsedQuery {
 		// contraction expansion are treated as plain terms.
 		switch w {
 		case "AND":
-			// Retroactively promote the last Should token to Must — both sides of
-			// "A AND B" become required.
-			if len(pq.Should) > 0 {
-				last := pq.Should[len(pq.Should)-1]
-				pq.Should = pq.Should[:len(pq.Should)-1]
-				pq.Must = append(pq.Must, last)
+			// Retroactively promote every token the previous word maps to —
+			// not just the last one, since a single word can expand into
+			// several via synonym expansion or a phrase — to Must. Both
+			// sides of "A AND B" become required in full. Looked up by
+			// value in pq.Should (not by position) so a token still gets
+			// promoted even if the word contributed nothing *new* to
+			// Should because it duplicated an earlier word.
+			for _, tk := range lastWordTokens {
+				for idx, s := range pq.Should {
+					if s == tk {
+						pq.Should = append(pq.Should[:idx], pq.Should[idx+1:]...)
+						pq.Must = appendUniq(pq.Must, []string{tk})
+						break
+					}
+				}
 			}
+			lastWordTokens = nil
 			nextMust = true
 			i++
 			continue
@@ -140,6 +174,7 @@ func ParseQuery(q string, tok *Tokenizer, synonyms *SynonymMap) *ParsedQuery {
 			pq.Must = appendUniq(pq.Must, tokens)
 			nextMust = false
 		default:
+			lastWordTokens = tokens
 			pq.Should = appendUniq(pq.Should, tokens)
 		}
 

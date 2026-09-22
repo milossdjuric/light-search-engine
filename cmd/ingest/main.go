@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -336,6 +337,12 @@ func postBatch(cli *http.Client, server string, batch []Record) (int, int, int) 
 		return 0, len(batch), bytesSent
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		log.Printf("post batch error: server returned %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+		return 0, len(batch), bytesSent
+	}
 
 	var result struct {
 		Indexed int `json:"indexed"`

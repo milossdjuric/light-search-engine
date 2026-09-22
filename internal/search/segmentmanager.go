@@ -349,7 +349,7 @@ func (sm *SegmentManager) Reset(ctx context.Context) error {
 	sm.walMu.Lock()
 	defer sm.walMu.Unlock()
 
-	keys, err := sm.store.List(ctx, "segments/"+sm.shardID)
+	keys, err := sm.store.List(ctx, "segments/"+sm.shardID+"_")
 	if err != nil {
 		return fmt.Errorf("Reset list segments: %w", err)
 	}

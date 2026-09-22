@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -304,3 +306,31 @@ func parseInt(s string) (int, error) {
 type portError struct{ s string }
 
 func (e *portError) Error() string { return "invalid port: " + e.s }
+
+// TestBuildK8sClientFromCAFallsBackOnMalformedCert verifies that a present
+// but malformed CA cert file makes buildK8sClientFromCA fall back to the
+// default client (system roots), the same as when the file is missing —
+// not silently install an empty, non-nil trust pool that would reject every
+// TLS handshake.
+func TestBuildK8sClientFromCAFallsBackOnMalformedCert(t *testing.T) {
+	badCertPath := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(badCertPath, []byte("not a valid PEM certificate"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	client := buildK8sClientFromCA(badCertPath)
+
+	if client.Transport != nil {
+		t.Errorf("Transport = %v, want nil (default transport / system roots) for a malformed CA cert", client.Transport)
+	}
+}
+
+// TestBuildK8sClientFromCAMissingFileUsesDefaultClient documents the existing,
+// already-correct behavior for comparison: a missing CA file also falls back
+// to the default client.
+func TestBuildK8sClientFromCAMissingFileUsesDefaultClient(t *testing.T) {
+	client := buildK8sClientFromCA(filepath.Join(t.TempDir(), "does-not-exist.crt"))
+	if client.Transport != nil {
+		t.Errorf("Transport = %v, want nil (default transport / system roots) for a missing CA cert", client.Transport)
+	}
+}

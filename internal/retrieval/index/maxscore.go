@@ -118,6 +118,29 @@ func NewMaxScoreSearcher(idx IndexReader, scorer Scorer) *MaxScoreSearcher {
 	return ms
 }
 
+// findPivot returns the LARGEST i where suffixUB[i] >= θ (n if none does).
+// suffixUB[i] is the sum of ub over entries[i:], and entries are
+// ub-ascending, so suffixUB is non-increasing — once the condition fails
+// for some i it fails for every larger i too, so a forward scan can stop at
+// the first failure and keep the last i that still held. Terms before the
+// pivot (the low-UB head) are optional: even without them, entries[p:]
+// alone could still reach θ. θ=0 until the heap fills, in which case every
+// term is mandatory (p=0) since nothing can yet be safely skipped.
+func findPivot(suffixUB []float64, θ float64) int {
+	n := len(suffixUB)
+	if θ == 0 {
+		return 0
+	}
+	p := n
+	for i := 0; i < n; i++ {
+		if suffixUB[i] < θ {
+			break
+		}
+		p = i
+	}
+	return p
+}
+
 // Search returns the top-K documents for the given tokens using Block-Max MaxScore.
 func (s *MaxScoreSearcher) Search(tokens []string, topK int) []types.ScoredDocument {
 	// Cache index-level constants — each call is a map/slice read; hoisting them
@@ -193,15 +216,7 @@ func (s *MaxScoreSearcher) Search(tokens []string, topK int) []types.ScoredDocum
 	θ := 0.0
 
 	for {
-		// Find pivot: first i where suffixUB[i] >= θ.
-		// θ=0 until heap fills → p=0, all terms mandatory.
-		p := n
-		for i := 0; i < n; i++ {
-			if suffixUB[i] >= θ || θ == 0 {
-				p = i
-				break
-			}
-		}
+		p := findPivot(suffixUB, θ)
 		if p == n {
 			break
 		}

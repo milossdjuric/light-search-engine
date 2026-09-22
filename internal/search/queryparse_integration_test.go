@@ -133,3 +133,70 @@ func TestQueryParserTrailingQuestionMark(t *testing.T) {
 		t.Errorf("trailing ? changed result count: %d vs %d", len(withQ), len(withoutQ))
 	}
 }
+
+// TestQueryParserMustFilterUsesMostRecentSegmentCopy verifies that +term
+// filtering reflects a document's current (most recently flushed) content,
+// not a stale pre-update segment copy left behind until the next merge
+// consolidates them.
+func TestQueryParserMustFilterUsesMostRecentSegmentCopy(t *testing.T) {
+	sm := newTestShardManager(t, 1)
+	ctx := context.Background()
+
+	sm.IndexDoc(ctx, types.Document{ID: "d1", Text: "apple pie recipe"})
+	if err := sm.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	// Re-index the same doc with different content, then flush again — this
+	// leaves an older, superseded segment copy of d1 (still containing
+	// "apple") alongside the new one until the next merge.
+	sm.IndexDoc(ctx, types.Document{ID: "d1", Text: "banana bread recipe"})
+	if err := sm.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	results, _, err := sm.Search(ctx, "+apple", 10, nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	for _, r := range results {
+		if r.DocID == "d1" {
+			t.Errorf("d1 should be excluded by +apple — its current content ('banana bread recipe') doesn't contain 'apple', only a stale pre-update segment copy does: results=%v", results)
+		}
+	}
+}
+
+// TestQueryParserPhraseFilterChecksUnflushedBufferDoc verifies that a
+// quoted-phrase filter is enforced for a freshly-indexed, not-yet-flushed
+// document too — not silently skipped because loadDocText only checked
+// on-disk segments and returned "" for a buffer-only doc.
+func TestQueryParserPhraseFilterChecksUnflushedBufferDoc(t *testing.T) {
+	sm := newTestShardManager(t, 1)
+	ctx := context.Background()
+
+	// Contains both phrase words separately (so it token-matches for
+	// scoring) but not the literal substring "lazy dog" — and is never
+	// flushed, so it only exists in the in-memory buffer.
+	sm.IndexDoc(ctx, types.Document{ID: "no-phrase", Text: "the dog was not lazy at all, he ran fast"})
+	// A genuine match, also unflushed, as a regression check that the fix
+	// doesn't just always exclude buffer docs.
+	sm.IndexDoc(ctx, types.Document{ID: "has-phrase", Text: "watching a lazy dog sleep all day"})
+
+	results, _, err := sm.Search(ctx, `"lazy dog"`, 10, nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	for _, r := range results {
+		if r.DocID == "no-phrase" {
+			t.Errorf(`"no-phrase" doc should be excluded — it contains "lazy" and "dog" separately but not the literal phrase "lazy dog", and phrase filtering must still apply to an unflushed buffer doc: results=%v`, results)
+		}
+	}
+	found := false
+	for _, r := range results {
+		if r.DocID == "has-phrase" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf(`"has-phrase" doc (literal "lazy dog" substring, unflushed) should be in results, got %v`, results)
+	}
+}

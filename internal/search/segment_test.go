@@ -87,6 +87,37 @@ func TestMergeSegmentsUnion(t *testing.T) {
 	}
 }
 
+// TestMergeSegmentsDropsTombstonedDocs verifies that a docID passed in the
+// tombstones set is entirely absent from the merged output segment, rather
+// than being silently carried forward.
+func TestMergeSegmentsDropsTombstonedDocs(t *testing.T) {
+	dir := t.TempDir()
+
+	docsA := []types.Document{
+		{ID: "keep", Text: "alpha beta gamma"},
+		{ID: "victim", Text: "delta epsilon zeta"},
+	}
+	pathA := buildSegment(t, dir, "segA", docsA)
+	segA, _ := search.LoadSegment(pathA)
+
+	outPath := filepath.Join(dir, "merged.seg")
+	tombstones := map[string]struct{}{"victim": {}}
+	if err := search.MergeSegmentsWithOptions(outPath, []*search.Segment{segA}, search.SegmentWriteOptions{}, tombstones); err != nil {
+		t.Fatalf("MergeSegmentsWithOptions: %v", err)
+	}
+
+	merged, err := search.LoadSegment(outPath)
+	if err != nil {
+		t.Fatalf("LoadSegment merged: %v", err)
+	}
+	if merged.DocCount() != 1 {
+		t.Errorf("merged DocCount: want 1 (tombstoned doc dropped), got %d", merged.DocCount())
+	}
+	if merged.HasTerm("delta", "victim") {
+		t.Error("merged segment still contains postings for tombstoned doc \"victim\"")
+	}
+}
+
 // TestWriteLoadSegmentBM25FRoundTrip verifies that a segment written with BM25F
 // pseudo-TF encoding loads correctly and returns ranked results when searched
 // with a BM25F scorer. The title field is weighted higher than body, so a

@@ -264,9 +264,14 @@ func (w *K8sMemberWatcher) probeLocalShards(ctx context.Context, addr string) ([
 // Falls back to the default client (which trusts system roots) if the cert
 // is not available (e.g. during local development).
 func buildK8sClient() *http.Client {
+	return buildK8sClientFromCA(saCACertPath)
+}
+
+// buildK8sClientFromCA is buildK8sClient with the CA cert path parameterized,
+// so tests can point it at a fixture file instead of the real in-cluster path.
+func buildK8sClientFromCA(caPath string) *http.Client {
 	pool := x509.NewCertPool()
-	if ca, err := os.ReadFile(saCACertPath); err == nil {
-		pool.AppendCertsFromPEM(ca)
+	if ca, err := os.ReadFile(caPath); err == nil && pool.AppendCertsFromPEM(ca) {
 		return &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{RootCAs: pool},

@@ -224,6 +224,12 @@ type IndexBuilder struct {
 	docToID map[string]uint32
 	docList []string // ID → docID string
 	docLens []int    // ID → document length (tokens)
+	// docLive[id] is false for a doc slot superseded by a later internDoc()
+	// call for the same docID (re-Add() before Build(), i.e. an upsert within
+	// one flush window). Its earlier postings are dropped at Build() time so
+	// the last Add() wins, matching docLens being overwritten in place.
+	docLive           []bool
+	hasSupersededDocs bool
 
 	// External posting accumulator: rawPosting records written to a temp file.
 	// One bufio.Write per document (all its terms concatenated) amortises I/O
@@ -261,6 +267,7 @@ func NewIndexBuilder() *IndexBuilder {
 		docToID:    make(map[string]uint32, 65536), // 2^16: typical 50k docs
 		docList:    make([]string, 0, 65536),
 		docLens:    make([]int, 0, 65536),
+		docLive:    make([]bool, 0, 65536),
 		postFile:   f,
 		postBuf:    bufio.NewWriterSize(f, 1<<20), // 1 MiB write buffer
 		addScratch: make([]byte, 0, 128*12),       // pre-size for a typical ~30-term doc
@@ -276,6 +283,8 @@ func (b *IndexBuilder) Reset() {
 	clear(b.docToID)
 	b.docList = b.docList[:0]
 	b.docLens = b.docLens[:0]
+	b.docLive = b.docLive[:0]
+	b.hasSupersededDocs = false
 	b.totalTokens = 0
 	b.N = 0
 	b.memEstimate = 0
@@ -310,11 +319,23 @@ func (b *IndexBuilder) internDoc(docID string, docLen int) uint32 {
 		b.docToID[docID] = did
 		b.docList = append(b.docList, docID)
 		b.docLens = append(b.docLens, docLen)
+		b.docLive = append(b.docLive, true)
 		b.memEstimate += int64(len(docID)) + 8
-	} else {
-		b.docLens[did] = docLen
+		return did
 	}
-	return did
+	// Re-added before Build() (upsert within one flush window): the old did's
+	// rawPosting records are already written to postFile and can't be cheaply
+	// erased, so mark that slot superseded — buildInternal drops its postings
+	// and excludes it from N/totalTokens — and allocate a fresh slot for the
+	// new content, matching docLens being overwritten in place.
+	b.docLive[did] = false
+	b.hasSupersededDocs = true
+	newDid := uint32(len(b.docList))
+	b.docToID[docID] = newDid
+	b.docList = append(b.docList, docID)
+	b.docLens = append(b.docLens, docLen)
+	b.docLive = append(b.docLive, true)
+	return newDid
 }
 
 // internTerm returns the insertion-order numeric ID for term, creating one if needed.
@@ -580,13 +601,60 @@ func (b *IndexBuilder) buildInternal(useFOR32 bool) *InvertedIndex {
 		postings[i].TF = binary.LittleEndian.Uint32(raw[off+8:])
 	}
 
-	avgDocLen := float64(b.totalTokens) / float64(b.N)
+	// Drop postings for doc slots superseded by a re-Add() before Build()
+	// (see internDoc), and compact numeric doc IDs to exclude them, so a
+	// re-indexed doc's earlier content doesn't survive as duplicate postings
+	// alongside its latest content. Builds into local variables rather than
+	// mutating b.docList/b.docLens/b.N/b.totalTokens in place: Snapshot()
+	// documents that it can be called repeatedly "without clearing the
+	// builder", and postFile (read again from scratch on every call, since
+	// b.postCount is never trimmed) always yields the same raw postings —
+	// including the superseded ones — so this filtering must be redone
+	// identically on every call, not just the first.
+	docList := b.docList
+	docLens := b.docLens
+	docCount := b.N
+	totalTokens := b.totalTokens
+	if b.hasSupersededDocs {
+		finalID := make([]int32, len(b.docList))
+		liveDocList := make([]string, 0, len(b.docList))
+		liveDocLens := make([]int, 0, len(b.docList))
+		for i, live := range b.docLive {
+			if !live {
+				finalID[i] = -1
+				continue
+			}
+			finalID[i] = int32(len(liveDocList))
+			liveDocList = append(liveDocList, b.docList[i])
+			liveDocLens = append(liveDocLens, b.docLens[i])
+		}
+		docList = liveDocList
+		docLens = liveDocLens
+
+		kept := make([]rawPosting, 0, len(postings))
+		for _, p := range postings {
+			if fid := finalID[p.DocID]; fid >= 0 {
+				p.DocID = uint32(fid)
+				kept = append(kept, p)
+			}
+		}
+		postings = kept
+
+		docCount = len(liveDocList)
+		var total int64
+		for _, l := range liveDocLens {
+			total += int64(l)
+		}
+		totalTokens = total
+	}
+
+	avgDocLen := float64(totalTokens) / float64(docCount)
 	nTerms := len(b.termList)
-	nDocs := len(b.docList)
+	nDocs := len(docList)
 
 	// 1. Assign numeric docIDs in insertion order (no sort needed).
 	allDocIDs := make([]string, nDocs)
-	copy(allDocIDs, b.docList)
+	copy(allDocIDs, docList)
 	docIDIndex := make(map[string]uint64, nDocs)
 	for i, id := range allDocIDs {
 		docIDIndex[id] = uint64(i)
@@ -675,8 +743,8 @@ func (b *IndexBuilder) buildInternal(useFOR32 bool) *InvertedIndex {
 				docDeltas[j] = delta
 				tfVals[j] = uint64(p.TF)
 
-				dl := b.docLens[p.DocID]
-				score := bm25Score(int(p.TF), df, dl, avgDocLen, b.N, k1Default, bDefault)
+				dl := docLens[p.DocID]
+				score := bm25Score(int(p.TF), df, dl, avgDocLen, docCount, k1Default, bDefault)
 				if score > blockMaxImpact {
 					blockMaxImpact = score
 				}
@@ -722,8 +790,8 @@ func (b *IndexBuilder) buildInternal(useFOR32 bool) *InvertedIndex {
 				data = AppendVarint(data, delta)
 				data = AppendVarint(data, uint64(p.TF))
 
-				dl := b.docLens[p.DocID]
-				score := bm25Score(int(p.TF), df, dl, avgDocLen, b.N, k1Default, bDefault)
+				dl := docLens[p.DocID]
+				score := bm25Score(int(p.TF), df, dl, avgDocLen, docCount, k1Default, bDefault)
 				if score > maxUB {
 					maxUB = score
 				}
@@ -741,8 +809,8 @@ func (b *IndexBuilder) buildInternal(useFOR32 bool) *InvertedIndex {
 
 	// Build docLengths map for the InvertedIndex.
 	docLengthsCopy := make(map[string]int, nDocs)
-	for i, id := range b.docList {
-		docLengthsCopy[id] = b.docLens[i]
+	for i, id := range docList {
+		docLengthsCopy[id] = docLens[i]
 	}
 
 	return &InvertedIndex{
@@ -757,7 +825,7 @@ func (b *IndexBuilder) buildInternal(useFOR32 bool) *InvertedIndex {
 		docIDIndex: docIDIndex,
 		docLengths: docLengthsCopy,
 		avgDocLen:  avgDocLen,
-		N:          b.N,
+		N:          docCount,
 		useFOR32:   useFOR32,
 	}
 }

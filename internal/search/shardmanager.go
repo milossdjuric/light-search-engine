@@ -495,6 +495,9 @@ func (m *ShardManager) GetDocText(docID string) (string, bool) {
 	}
 	// Search segments in reverse order (newest first).
 	for i := len(segs) - 1; i >= 0; i-- {
+		if segs[i] == nil {
+			continue
+		}
 		if text, ok := segs[i].GetText(docID); ok {
 			m.docCache.Add(docID, text)
 			return text, true

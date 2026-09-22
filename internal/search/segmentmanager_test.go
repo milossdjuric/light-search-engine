@@ -1,7 +1,10 @@
 package search_test
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"search-eval-platform/internal/retrieval/bm25"
@@ -11,9 +14,14 @@ import (
 
 func newTestSegMgr(t *testing.T, dataDir string) *search.SegmentManager {
 	t.Helper()
+	return newTestSegMgrWithShard(t, dataDir, "shard0")
+}
+
+func newTestSegMgrWithShard(t *testing.T, dataDir, shardID string) *search.SegmentManager {
+	t.Helper()
 	scorer := bm25.NewScorerOnly(1.2, 0.75)
 	policy := search.DefaultTieredMergePolicy()
-	sm, err := search.NewSegmentManager("shard0", dataDir, scorer, policy)
+	sm, err := search.NewSegmentManager(shardID, dataDir, scorer, policy)
 	if err != nil {
 		t.Fatalf("NewSegmentManager: %v", err)
 	}
@@ -320,5 +328,129 @@ func TestInterSegmentMaxScorePruning(t *testing.T) {
 			t.Errorf("duplicate docID in results: %s", r.DocID)
 		}
 		seen[r.DocID] = struct{}{}
+	}
+}
+
+// TestSegmentManagerForceMergeDeletesPurgesTombstonedDoc verifies that a
+// merge triggered via ForceMergeDeletes physically drops a tombstoned doc
+// from the output segment, and that the resulting segment record's
+// DeletedDocs count reflects that the doc is gone (0), not stale.
+func TestSegmentManagerForceMergeDeletesPurgesTombstonedDoc(t *testing.T) {
+	sm := newTestSegMgr(t, t.TempDir())
+
+	docs := []types.Document{
+		{ID: "keep", Text: "alpha beta gamma"},
+		{ID: "victim", Text: "delta epsilon zeta"},
+	}
+	for _, d := range docs {
+		if err := sm.IndexDocument(d); err != nil {
+			t.Fatalf("IndexDocument %s: %v", d.ID, err)
+		}
+	}
+	if err := sm.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := sm.DeleteDocument("victim"); err != nil {
+		t.Fatalf("DeleteDocument: %v", err)
+	}
+	// Force the segment to load: DeletedDocs is only tracked for loaded
+	// segments (incrementDeletedDocsLocked skips nil placeholders), and a
+	// fresh Flush() leaves the segment nil until first accessed.
+	if _, err := sm.Search("alpha", 10, nil); err != nil {
+		t.Fatalf("Search (force load): %v", err)
+	}
+
+	if err := sm.ForceMergeDeletes(context.Background(), 0); err != nil {
+		t.Fatalf("ForceMergeDeletes: %v", err)
+	}
+
+	recs := sm.SegmentRecords()
+	if len(recs) != 1 {
+		t.Fatalf("want 1 segment record after merge, got %d", len(recs))
+	}
+	if recs[0].DocCount != 1 {
+		t.Errorf("merged segment DocCount: want 1 (victim purged), got %d", recs[0].DocCount)
+	}
+	if recs[0].DeletedDocs != 0 {
+		t.Errorf("merged segment DeletedDocs: want 0 (victim physically gone), got %d", recs[0].DeletedDocs)
+	}
+}
+
+// TestSegmentManagerForceMergeDeletesPrunesTombstone verifies that once a
+// merge physically purges a tombstoned doc from every segment, its tombstone
+// entry is also removed — leaving it behind would grow sm.tombstones
+// unboundedly over a shard's lifetime and add redundant scan work to every
+// future merge for a doc that's already gone.
+func TestSegmentManagerForceMergeDeletesPrunesTombstone(t *testing.T) {
+	sm := newTestSegMgr(t, t.TempDir())
+
+	docs := []types.Document{
+		{ID: "keep", Text: "alpha beta gamma"},
+		{ID: "victim", Text: "delta epsilon zeta"},
+	}
+	for _, d := range docs {
+		if err := sm.IndexDocument(d); err != nil {
+			t.Fatalf("IndexDocument %s: %v", d.ID, err)
+		}
+	}
+	if err := sm.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := sm.DeleteDocument("victim"); err != nil {
+		t.Fatalf("DeleteDocument: %v", err)
+	}
+	if _, err := sm.Search("alpha", 10, nil); err != nil {
+		t.Fatalf("Search (force load): %v", err)
+	}
+
+	if got := sm.Status().DeletedDocs; got != 1 {
+		t.Fatalf("DeletedDocs before merge = %d, want 1", got)
+	}
+
+	if err := sm.ForceMergeDeletes(context.Background(), 0); err != nil {
+		t.Fatalf("ForceMergeDeletes: %v", err)
+	}
+
+	if got := sm.Status().DeletedDocs; got != 0 {
+		t.Errorf("DeletedDocs after merge = %d, want 0 (tombstone for physically-purged doc should be pruned)", got)
+	}
+}
+
+// TestSegmentManagerResetDoesNotDeletePrefixCollidingShard verifies that
+// Reset on shard "shard1" does not delete segment files belonging to
+// "shard10", which shares a naive string prefix ("shard1") but is a
+// different shard.
+func TestSegmentManagerResetDoesNotDeletePrefixCollidingShard(t *testing.T) {
+	dataDir := t.TempDir()
+
+	sm1 := newTestSegMgrWithShard(t, dataDir, "shard1")
+	sm10 := newTestSegMgrWithShard(t, dataDir, "shard10")
+
+	if err := sm10.IndexDocument(types.Document{ID: "victim", Text: "keep me safe"}); err != nil {
+		t.Fatalf("IndexDocument: %v", err)
+	}
+	if err := sm10.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	segDir := filepath.Join(dataDir, "segments")
+	before, err := os.ReadDir(segDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(before) == 0 {
+		t.Fatal("expected shard10 to have written at least one segment file before reset")
+	}
+
+	if err := sm1.Reset(context.Background()); err != nil {
+		t.Fatalf("shard1 Reset: %v", err)
+	}
+
+	after, err := os.ReadDir(segDir)
+	if err != nil {
+		t.Fatalf("ReadDir after reset: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("shard1.Reset() deleted shard10's segment files: before=%d files, after=%d files", len(before), len(after))
 	}
 }

@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync/atomic"
@@ -124,8 +125,22 @@ func (r *ReplicaApplier) stream() error {
 	// Reset backoff on successful connect.
 	slog.Info("replica: connected to primary", "shard", r.shardID, "addr", r.primaryAddr)
 
+	return r.applyStream(stream)
+}
+
+// walEntryReceiver is the subset of WALReplication_StreamWALClient that
+// applyStream needs; narrowing it lets tests drive applyStream without a
+// live gRPC connection.
+type walEntryReceiver interface {
+	Recv() (*WALEntry, error)
+}
+
+// applyStream reads entries from recv until it errors (including io.EOF) and
+// applies each one via r.apply, advancing appliedSeq only for entries that
+// applied successfully.
+func (r *ReplicaApplier) applyStream(recv walEntryReceiver) error {
 	for {
-		entry, err := stream.Recv()
+		entry, err := recv.Recv()
 		if err != nil {
 			return err
 		}
@@ -135,10 +150,26 @@ func (r *ReplicaApplier) stream() error {
 			continue
 		}
 
+		// A gap here means an entry was dropped upstream (e.g. the primary's
+		// fan-out channel was full — see Append's select/default). Applying
+		// entry.Seq directly would silently and permanently lose the missing
+		// one; force a reconnect instead so run()'s backoff loop re-requests
+		// FromSeq: appliedSeq and the primary's catch-up phase (ring or WAL
+		// file) resends everything from there, including the dropped entry.
+		if want := r.appliedSeq.Load() + 1; entry.Seq != want {
+			slog.Warn("replica: sequence gap detected, forcing resync",
+				"shard", r.shardID, "want", want, "got", entry.Seq)
+			return fmt.Errorf("replica: sequence gap detected: want seq %d, got %d", want, entry.Seq)
+		}
+
 		if err := r.apply(entry.Op, entry.DocId, entry.Text, entry.Metadata); err != nil {
 			slog.Error("replica: apply error", "seq", entry.Seq, "err", err)
-			// Continue applying; don't reconnect for application errors.
-			continue
+			// Stop consuming this stream rather than skipping ahead: appliedSeq
+			// stays at the last successfully-applied entry, so run()'s
+			// reconnect-with-backoff loop re-requests from here and the failed
+			// entry (and anything after it on this stream) gets retried in
+			// order instead of being silently lost.
+			return err
 		}
 
 		r.appliedSeq.Store(entry.Seq)

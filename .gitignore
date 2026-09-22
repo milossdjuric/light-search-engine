@@ -24,7 +24,15 @@ bench/beir_results.json
 # Agent-specific memory (not part of the codebase)
 memory/
 
+# Internal docs kept local-only, not published to the public repo
+CLAUDE.md
+SPEC.md
+MANUAL.md
+FUTURE_SPEC_2026-05-20.md
+docs/
+
 # Editor / OS
 .DS_Store
 *.swp
 *.swo
+native/**/target/
