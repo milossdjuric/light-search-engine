@@ -155,6 +155,14 @@ func isASCII(s string) bool {
 // tokenizeASCII is the fast path for pure ASCII input.
 // Avoids rune decoding, []rune allocation, and Unicode table lookups.
 // Lowercase is a single bit-or: 'A'|0x20 == 'a'.
+//
+// Deliberately gives each token its own string(buf) conversion rather than
+// concatenating a document's tokens into one shared backing array: since
+// IndexBuilder.Add interns at least one token per document permanently into
+// termList, sharing a backing array pins every other token from that
+// document alive for the IndexBuilder's whole lifetime, not just the one
+// that's actually retained. Measured 5x slower overall despite far fewer
+// allocations when tried.
 func tokenizeASCII(text string) []string {
 	tokens := make([]string, 0, 8)
 	buf := make([]byte, 0, 32)
@@ -873,6 +881,14 @@ func (idx *InvertedIndex) AvgDocLen() float64 {
 	return idx.avgDocLen
 }
 
+// UsesFOR32 reports whether this index's posting blocks are encoded with
+// PackFOR32 (v6, SIMD-decodable via UnpackFOR32Into) rather than the
+// intcomp-based encoding (v2/v4). Set at build time by buildInternal's
+// useFOR32 parameter; see BuildOptions.UseFOR32.
+func (idx *InvertedIndex) UsesFOR32() bool {
+	return idx.useFOR32
+}
+
 // DocLen returns the length of the document with the given string ID.
 func (idx *InvertedIndex) DocLen(docID string) int {
 	return idx.docLengths[docID]
@@ -1183,13 +1199,13 @@ func (b *IndexBuilder) AddFields(docID string, fieldTokens map[string][]string) 
 func (b *IndexBuilder) BuildWithOptions(opts BuildOptions) *InvertedIndex {
 	switch {
 	case len(opts.Fields) > 0 && b.fieldTFs != nil:
-		return b.BuildBM25F(opts.Fields)
+		return b.BuildBM25F(opts.Fields, opts.UseFOR32)
 	case opts.BM25FScaled:
 		k1 := opts.BM25FK1
 		if k1 <= 0 {
 			k1 = 1.2
 		}
-		return b.buildScaledPseudoTF(k1)
+		return b.buildScaledPseudoTF(k1, opts.UseFOR32)
 	default:
 		return b.buildInternal(opts.UseFOR32)
 	}
@@ -1198,12 +1214,14 @@ func (b *IndexBuilder) BuildWithOptions(opts BuildOptions) *InvertedIndex {
 // BuildBM25F builds an InvertedIndex from per-field data accumulated via AddFields.
 // Pseudo-TF = Σ_f w_f * tf(t,d,f) / (1 - b_f + b_f * len_f(d) / avglen_f) is
 // computed here and stored scaled as an integer. Block-max impacts are computed
-// using the BM25F saturation formula.
-func (b *IndexBuilder) BuildBM25F(fields []FieldConfig) *InvertedIndex {
+// using the BM25F saturation formula. useFOR32 selects PackFOR32 (v6,
+// SIMD-decodable) over the default intcomp-based block encoding, matching
+// buildInternal's dispatch.
+func (b *IndexBuilder) BuildBM25F(fields []FieldConfig, useFOR32 bool) *InvertedIndex {
 	const k1 = 1.2
 
 	if b.N == 0 || b.fieldTFs == nil {
-		return b.Build()
+		return b.buildInternal(useFOR32)
 	}
 
 	// 1. Compute avgFieldLen per field across all docs.
@@ -1289,7 +1307,14 @@ func (b *IndexBuilder) BuildBM25F(fields []FieldConfig) *InvertedIndex {
 	ubs := make([]float64, nTerms)
 	var data []byte
 
-	packBuf := make([]byte, blockPackBufSize)
+	packBufSize := blockPackBufSize
+	if useFOR32 {
+		packBufSize = PackFOR32BufSize
+	}
+	packBuf := make([]byte, packBufSize)
+	// uint32 versions for PackFOR32 encoding.
+	docDeltasU32 := make([]uint32, BlockSize)
+	tfValsU32 := make([]uint32, BlockSize)
 
 	for termOrd, term := range terms {
 		entries := synPostings[term]
@@ -1336,10 +1361,22 @@ func (b *IndexBuilder) BuildBM25F(fields []FieldConfig) *InvertedIndex {
 				}
 			}
 
-			n := PackBlock(docDeltas, packBuf)
-			data = append(data, packBuf[:n]...)
-			n = PackBlock(tfVals, packBuf)
-			data = append(data, packBuf[:n]...)
+			var n int
+			if useFOR32 {
+				for j := range docDeltasU32 {
+					docDeltasU32[j] = uint32(docDeltas[j])
+					tfValsU32[j] = uint32(tfVals[j])
+				}
+				n = PackFOR32(docDeltasU32, packBuf)
+				data = append(data, packBuf[:n]...)
+				n = PackFOR32(tfValsU32, packBuf)
+				data = append(data, packBuf[:n]...)
+			} else {
+				n = PackBlock(docDeltas, packBuf)
+				data = append(data, packBuf[:n]...)
+				n = PackBlock(tfVals, packBuf)
+				data = append(data, packBuf[:n]...)
+			}
 
 			l0DocIDs = append(l0DocIDs, prevDocID)
 			l0Offsets = append(l0Offsets, blockStartOff)
@@ -1394,13 +1431,16 @@ func (b *IndexBuilder) BuildBM25F(fields []FieldConfig) *InvertedIndex {
 		docLengths: docLengthsCopy,
 		avgDocLen:  float64(b.totalTokens) / float64(b.N),
 		N:          b.N,
+		useFOR32:   useFOR32,
 	}
 }
 
 // buildScaledPseudoTF builds an InvertedIndex from postings that already
 // contain scaled pseudo-TFs (used during segment merge of BM25F segments).
 // Block-max impacts are computed using the BM25F saturation formula.
-func (b *IndexBuilder) buildScaledPseudoTF(k1 float64) *InvertedIndex {
+// useFOR32 selects PackFOR32 over the default intcomp-based block encoding,
+// matching buildInternal's dispatch.
+func (b *IndexBuilder) buildScaledPseudoTF(k1 float64, useFOR32 bool) *InvertedIndex {
 	if b.N == 0 {
 		return &InvertedIndex{
 			termIndex:  make(map[string]int),
@@ -1474,9 +1514,16 @@ func (b *IndexBuilder) buildScaledPseudoTF(k1 float64) *InvertedIndex {
 	ubs := make([]float64, nTerms)
 	var data []byte
 
-	packBuf := make([]byte, blockPackBufSize)
+	packBufSize := blockPackBufSize
+	if useFOR32 {
+		packBufSize = PackFOR32BufSize
+	}
+	packBuf := make([]byte, packBufSize)
 	docDeltas := make([]uint64, BlockSize)
 	tfVals := make([]uint64, BlockSize)
+	// uint32 versions for PackFOR32 encoding.
+	docDeltasU32 := make([]uint32, BlockSize)
+	tfValsU32 := make([]uint32, BlockSize)
 
 	for termOrd, term := range terms {
 		ingestID := termIngestID[term]
@@ -1519,10 +1566,22 @@ func (b *IndexBuilder) buildScaledPseudoTF(k1 float64) *InvertedIndex {
 				}
 			}
 
-			n := PackBlock(docDeltas, packBuf)
-			data = append(data, packBuf[:n]...)
-			n = PackBlock(tfVals, packBuf)
-			data = append(data, packBuf[:n]...)
+			var n int
+			if useFOR32 {
+				for j := range docDeltasU32 {
+					docDeltasU32[j] = uint32(docDeltas[j])
+					tfValsU32[j] = uint32(tfVals[j])
+				}
+				n = PackFOR32(docDeltasU32, packBuf)
+				data = append(data, packBuf[:n]...)
+				n = PackFOR32(tfValsU32, packBuf)
+				data = append(data, packBuf[:n]...)
+			} else {
+				n = PackBlock(docDeltas, packBuf)
+				data = append(data, packBuf[:n]...)
+				n = PackBlock(tfVals, packBuf)
+				data = append(data, packBuf[:n]...)
+			}
 
 			l0DocIDs = append(l0DocIDs, prevDocID)
 			l0Offsets = append(l0Offsets, blockStartOff)
@@ -1577,6 +1636,7 @@ func (b *IndexBuilder) buildScaledPseudoTF(k1 float64) *InvertedIndex {
 		docLengths: docLengthsCopy,
 		avgDocLen:  avgDocLen,
 		N:          b.N,
+		useFOR32:   useFOR32,
 	}
 }
 

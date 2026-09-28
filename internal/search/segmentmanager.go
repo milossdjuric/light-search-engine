@@ -59,6 +59,7 @@ type SegmentManager struct {
 	bufferDocs   int
 	bufferDirty  bool
 	bufferIdx    *index.InvertedIndex // cached read snapshot; rebuilt when dirty
+	bufferDocIDs map[string]struct{} // cached buffer membership set; rebuilt alongside bufferIdx
 	bufferTexts  map[string]string    // docID → original text for in-flight buffer docs
 	nextSeq      int64
 	segments     []*Segment               // loaded segment objects (parallel to segRecords)
@@ -393,6 +394,7 @@ func (sm *SegmentManager) Reset(ctx context.Context) error {
 	sm.bufferDocs = 0
 	sm.bufferDirty = false
 	sm.bufferIdx = nil
+	sm.bufferDocIDs = nil
 	sm.bufferTexts = make(map[string]string, sm.maxBufferDocs)
 	sm.nextSeq = 1
 	sm.segments = nil

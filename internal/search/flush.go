@@ -53,6 +53,7 @@ func (sm *SegmentManager) flushOrSwap() error {
 	sm.bufferDocs = 0
 	sm.bufferDirty = false
 	sm.bufferIdx = nil
+	sm.bufferDocIDs = nil
 	sm.bufferTexts = make(map[string]string, sm.maxBufferDocs)
 	sm.mu.Unlock() // release mu before any I/O
 
@@ -244,6 +245,7 @@ func (sm *SegmentManager) flushLocked() error {
 	sm.bufferDocs = 0
 	sm.bufferDirty = false
 	sm.bufferIdx = nil
+	sm.bufferDocIDs = nil
 
 	// Rotate WAL: seal current file, open next numbered file, delete sealed file.
 	if err := sm.rotateWALLocked(flushSeq); err != nil {

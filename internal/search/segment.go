@@ -260,6 +260,10 @@ func writeFromIndexWithOptions(path string, idx *index.InvertedIndex, opts Segme
 		return fmt.Errorf("WriteSegment create %s: %w", path, err)
 	}
 	defer f.Close()
+	// Buffer all writes below: the TermInfoStore section issues one write
+	// call per term, and without buffering that's one write() syscall per
+	// term (measured: ~3000 syscalls, ~85ms, for a 3000-term segment).
+	bw := bufio.NewWriterSize(f, 256*1024)
 
 	// 1. Build FST from sorted terms.
 	// vellum.Builder requires strictly ascending key order; Build() already
@@ -384,17 +388,16 @@ func writeFromIndexWithOptions(path string, idx *index.InvertedIndex, opts Segme
 	//   v2 = uncompressed, v4 = lz4.
 
 	// Write everything in order.
-	w := io.Writer(f)
-	if _, err := w.Write(hdr[:headerSize]); err != nil {
+	if _, err := bw.Write(hdr[:headerSize]); err != nil {
 		return err
 	}
 	// FST section
 	var fstLenBuf [4]byte
 	binary.LittleEndian.PutUint32(fstLenBuf[:], uint32(len(fstData)))
-	if _, err := f.Write(fstLenBuf[:]); err != nil {
+	if _, err := bw.Write(fstLenBuf[:]); err != nil {
 		return err
 	}
-	if _, err := f.Write(fstData); err != nil {
+	if _, err := bw.Write(fstData); err != nil {
 		return err
 	}
 	// TermInfoStore
@@ -404,20 +407,20 @@ func writeFromIndexWithOptions(path string, idx *index.InvertedIndex, opts Segme
 		binary.LittleEndian.PutUint32(tibuf[4:8], math.Float32bits(ti.UB))
 		binary.LittleEndian.PutUint64(tibuf[8:16], ti.PostingsOffset)
 		binary.LittleEndian.PutUint64(tibuf[16:24], ti.PostingsLen)
-		if _, err := f.Write(tibuf[:]); err != nil {
+		if _, err := bw.Write(tibuf[:]); err != nil {
 			return err
 		}
 	}
 	// DocLengths
-	if _, err := f.Write(docLenBuf); err != nil {
+	if _, err := bw.Write(docLenBuf); err != nil {
 		return err
 	}
 	// DocID strings
-	if _, err := f.Write(docIDData); err != nil {
+	if _, err := bw.Write(docIDData); err != nil {
 		return err
 	}
 	// PostingData
-	if _, err := f.Write(postData); err != nil {
+	if _, err := bw.Write(postData); err != nil {
 		return err
 	}
 
@@ -426,6 +429,9 @@ func writeFromIndexWithOptions(path string, idx *index.InvertedIndex, opts Segme
 	_ = postOff
 	_ = termOff
 
+	if err := bw.Flush(); err != nil {
+		return err
+	}
 	if err := f.Sync(); err != nil {
 		return err
 	}

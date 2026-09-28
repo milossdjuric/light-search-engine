@@ -130,27 +130,30 @@ func (sm *SegmentManager) Search(query string, topK int, scorer index.Scorer) ([
 	tombstones := sm.tombstones
 	tombBloom := sm.tombstoneBloom
 	bufIdx := sm.bufferIdx
+	bufferDocIDs := sm.bufferDocIDs
 	hasDocs := sm.bufferDocs > 0
-	// Snapshot which docIDs currently live in the buffer: the buffer always
-	// holds the most recent write for a docID, so a segment-sourced hit for
-	// a docID present here is a stale, superseded copy (see searchAll).
-	bufferDocIDs := make(map[string]struct{}, len(sm.bufferTexts))
-	for id := range sm.bufferTexts {
-		bufferDocIDs[id] = struct{}{}
-	}
 	sm.mu.RUnlock()
 
-	// Rebuild the buffer snapshot only when nil (i.e. right after a flush
-	// reset the buffer). Using a slightly stale snapshot between flushes is
+	// Rebuild the buffer snapshot (both the search index and the doc-ID
+	// membership set used to detect segment hits superseded by a newer
+	// buffer write — see searchAll) only when nil, i.e. right after a flush
+	// reset the buffer. Using a slightly stale snapshot between flushes is
 	// acceptable: any document missing from the snapshot will appear in a
 	// segment after the next flush. This avoids constant write-lock contention
-	// when concurrent writes keep bufferDirty true.
-	if bufIdx == nil && hasDocs {
+	// when concurrent writes keep bufferDirty true, and avoids rebuilding an
+	// O(buffer size) map on every single query.
+	if (bufIdx == nil || bufferDocIDs == nil) && hasDocs {
 		sm.mu.Lock()
-		if sm.bufferIdx == nil && sm.bufferDocs > 0 {
-			sm.bufferIdx = sm.buffer.BuildWithOptions(index.BuildOptions{Fields: sm.bm25fFields})
+		if (sm.bufferIdx == nil || sm.bufferDocIDs == nil) && sm.bufferDocs > 0 {
+			sm.bufferIdx = sm.buffer.BuildWithOptions(index.BuildOptions{Fields: sm.bm25fFields, UseFOR32: sm.useFOR32})
+			docIDs := make(map[string]struct{}, len(sm.bufferTexts))
+			for id := range sm.bufferTexts {
+				docIDs[id] = struct{}{}
+			}
+			sm.bufferDocIDs = docIDs
 		}
 		bufIdx = sm.bufferIdx
+		bufferDocIDs = sm.bufferDocIDs
 		sm.mu.Unlock()
 	}
 
