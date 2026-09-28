@@ -60,7 +60,7 @@ func UnpackBlock(src []byte, out []uint64) int {
 	for i := range compressed {
 		compressed[i] = binary.LittleEndian.Uint64(src[4+i*8:])
 	}
-	result := intcomp.UncompressUint64(compressed, out[:0])
+	result := uncompressUint64(compressed, out[:0])
 	// copy in case intcomp allocated a new backing array
 	copy(out[:BlockSize], result)
 	return 4 + n*8
@@ -82,9 +82,30 @@ func UnpackBlockWithScratch(src []byte, out []uint64, scratch []uint64) int {
 	for i := range compressed {
 		compressed[i] = binary.LittleEndian.Uint64(src[4+i*8:])
 	}
-	result := intcomp.UncompressUint64(compressed, out[:0])
+	result := uncompressUint64(compressed, out[:0])
 	copy(out[:BlockSize], result)
 	return 4 + n*8
+}
+
+// uncompressUint64 is intcomp.UncompressUint64 with delta-varbyte blocks
+// decoded by decodeDeltaVarByteRust (Rust on amd64+cgo, ~1.8x faster on
+// 128-value blocks; intcomp elsewhere). Since BlockSize (128) is below
+// intcomp.BitPackingBlockSize64 (256), every PackBlock output is a single
+// delta-varbyte block; the bit-packing branch is kept only for format
+// completeness.
+func uncompressUint64(in, out []uint64) []uint64 {
+	// Drop the trailing last-block-length word appended by CompressUint64.
+	if len(in) > 0 {
+		in = in[:len(in)-1]
+	}
+	for len(in) > 0 {
+		if int32(in[0]) < intcomp.BitPackingBlockSize64 {
+			in, out = decodeDeltaVarByteRust(in, out)
+		} else {
+			in, out = intcomp.UncompressDeltaBinPackUint64(in, out)
+		}
+	}
+	return out
 }
 
 // PackFOR32 compresses exactly BlockSize uint32 values into dst using bit-packing
