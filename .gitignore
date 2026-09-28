@@ -22,7 +22,7 @@ bench/beir_results.json
 *.pprof
 
 # Agent-specific memory (not part of the codebase)
-memory/
+/memory/
 
 # Internal docs kept local-only, not published to the public repo
 CLAUDE.md
