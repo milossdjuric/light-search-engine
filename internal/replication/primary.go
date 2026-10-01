@@ -1,348 +1,294 @@
 package replication
 
 import (
-	"bufio"
-	"context"
-	"encoding/binary"
-	"encoding/json"
-	"fmt"
-	"hash/crc32"
-	"io"
 	"log/slog"
-	"os"
 	"sync"
+	"sync/atomic"
 	"time"
-)
 
-// walFileEntry mirrors the NDJSON format written by SegmentManager.appendWAL.
-// Defined locally to avoid an import cycle with internal/search.
-type walFileEntry struct {
-	Seq      uint64            `json:"seq"`
-	Op       string            `json:"op"`
-	DocID    string            `json:"doc_id"`
-	Text     string            `json:"text,omitempty"`
-	Metadata map[string]string `json:"metadata,omitempty"`
-}
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
 
 const (
-	ringBufferSize = 10_000
+	ringBufferSize    = 10_000
 	heartbeatInterval = 5 * time.Second
+	replicaChanSize   = 256
 )
 
-// PrimaryReplicator streams WAL entries to replicas.
-// It maintains a ring buffer of recent entries for fast catch-up;
-// older entries are read directly from the WAL file.
+// CatchUpFunc calls fn, in seq order, for every entry still retained in the
+// primary's WAL files with seq > afterSeq (search.SegmentManager.ScanWAL).
+// Entries already flushed into segments are no longer retained.
+type CatchUpFunc func(afterSeq uint64, fn func(*WALEntry) error) error
+
+// PrimaryReplicator streams one shard's WAL entries to its replicas.
+//
+// A replica connecting with fromSeq is caught up from, in order: the WAL
+// files on disk (catchUp), the in-memory ring of recent entries, and finally
+// the live channel fed by Append. The sources overlap, so every entry at or
+// below the last one sent is skipped; a hole means the entries the replica
+// needs are gone, reported as FailedPrecondition (needs re-seeding) during
+// catch-up, or Unavailable (reconnect and catch up) in the live phase.
 type PrimaryReplicator struct {
-	shardID  string
-	walPath  string
+	shardID string
+	catchUp CatchUpFunc
+	lastSeq func() uint64 // latest seq assigned by the shard's WAL; nil = unknown
 
-	mu      sync.Mutex
-	ring    [ringBufferSize]*WALEntry
-	head    uint64 // next write index (monotonically increasing)
+	mu   sync.Mutex
+	ring [ringBufferSize]*WALEntry
+	head uint64 // highest seq appended + 1
 
-	// per-replica send channels (nodeID → channel)
 	repMu    sync.RWMutex
-	replicas map[string]chan *WALEntry
+	replicas map[uint64]chan *WALEntry // keyed by a per-connection ID
+	nextID   atomic.Uint64
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh    chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
-// NewPrimaryReplicator creates a PrimaryReplicator for the given shard.
-func NewPrimaryReplicator(shardID, walPath string) *PrimaryReplicator {
+// NewPrimaryReplicator creates a PrimaryReplicator for shardID. catchUp may be
+// nil, in which case only the ring buffer serves catch-up.
+func NewPrimaryReplicator(shardID string, catchUp CatchUpFunc) *PrimaryReplicator {
 	return &PrimaryReplicator{
 		shardID:  shardID,
-		walPath:  walPath,
-		replicas: make(map[string]chan *WALEntry),
+		catchUp:  catchUp,
+		replicas: make(map[uint64]chan *WALEntry),
 		stopCh:   make(chan struct{}),
 	}
 }
 
+// SetLastSeqFunc sets a function returning the latest seq the shard's WAL has
+// assigned. With it, a replica behind that seq whose missing entries are
+// retained nowhere is told to re-seed even when nothing at all is retained;
+// it also backs HeadSeq after a restart, before new writes arrive. Call
+// before serving replicas.
+func (p *PrimaryReplicator) SetLastSeqFunc(fn func() uint64) { p.lastSeq = fn }
+
+// ShardID returns the shard this replicator serves.
+func (p *PrimaryReplicator) ShardID() string { return p.shardID }
+
+// HeadSeq returns the highest seq appended so far (0 if none since start).
+func (p *PrimaryReplicator) HeadSeq() uint64 {
+	if p.lastSeq != nil {
+		return p.lastSeq()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.head == 0 {
+		return 0
+	}
+	return p.head - 1
+}
+
+// ReplicaCount returns the number of currently connected replica streams.
+func (p *PrimaryReplicator) ReplicaCount() int {
+	p.repMu.RLock()
+	defer p.repMu.RUnlock()
+	return len(p.replicas)
+}
+
 // Append adds a new WAL entry to the ring buffer and fans out to all replicas.
+// Must be called in strictly increasing seq order (the WAL hook guarantees
+// this). Never blocks: a replica whose channel is full misses the entry and
+// is forced to reconnect and catch up (see streamToReplica).
 //
-// The ring is indexed by the entry's own persistent Seq (not an internal
-// append counter): Seq is assigned by the WAL and keeps counting across
-// process restarts, while a counter that starts at 0 in every new
-// PrimaryReplicator would not — using it as the index would misalign catch-up
-// lookups (streamToReplica reads p.ring[seq%ringBufferSize] using real Seq
-// values) both across restarts and, since Seq starts at 1 rather than 0,
-// even within a single process lifetime.
+// The ring is indexed by the entry's own persistent Seq, which keeps counting
+// across restarts and resets, so catch-up lookups stay aligned.
 func (p *PrimaryReplicator) Append(entry *WALEntry) {
 	p.mu.Lock()
-	idx := entry.Seq % ringBufferSize
-	p.ring[idx] = entry
+	p.ring[entry.Seq%ringBufferSize] = entry
 	if entry.Seq+1 > p.head {
 		p.head = entry.Seq + 1
 	}
 	p.mu.Unlock()
 
 	p.repMu.RLock()
-	for nodeID, ch := range p.replicas {
+	for id, ch := range p.replicas {
 		select {
 		case ch <- entry:
 		default:
-			slog.Warn("primary: replica channel full, dropping (will catch up)",
-				"shard", p.shardID, "replica", nodeID)
+			slog.Warn("primary: replica channel full, dropping (replica will reconnect and catch up)",
+				"shard", p.shardID, "replica", id)
 		}
 	}
 	p.repMu.RUnlock()
 }
 
-// AddReplica registers a replica and starts a background goroutine that
-// streams entries starting from fromSeq via the provided stream sender.
-func (p *PrimaryReplicator) AddReplica(nodeID string, fromSeq uint64, stream WALReplication_StreamWALServer) {
-	ch := make(chan *WALEntry, 256)
-
-	p.repMu.Lock()
-	p.replicas[nodeID] = ch
-	p.repMu.Unlock()
-
+// AddReplica registers a replica stream starting after fromSeq and serves it
+// in a background goroutine until the stream ends or the replicator closes.
+func (p *PrimaryReplicator) AddReplica(fromSeq uint64, stream WALReplication_StreamWALServer) {
+	id, ch := p.register()
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		defer func() {
-			p.repMu.Lock()
-			delete(p.replicas, nodeID)
-			p.repMu.Unlock()
-		}()
-		p.streamToReplica(nodeID, fromSeq, ch, stream)
+		defer p.unregister(id)
+		if err := p.streamToReplica(fromSeq, ch, stream); err != nil {
+			slog.Warn("primary: replica stream ended", "shard", p.shardID, "replica", id, "err", err)
+		}
 	}()
 }
 
-// streamToReplica sends catch-up entries then tails the live channel.
-//
-// Catch-up has two phases:
-//  1. WAL-file phase: if the replica is further behind than the ring buffer
-//     covers, read the WAL file on disk and stream entries (fromSeq, ringStart).
-//  2. Ring-buffer phase: stream in-memory entries [ringStart, head).
-//
-// After both phases the goroutine enters the live-stream loop.
-func (p *PrimaryReplicator) streamToReplica(
-	nodeID string,
-	fromSeq uint64,
-	ch <-chan *WALEntry,
-	stream WALReplication_StreamWALServer,
-) {
-	p.mu.Lock()
-	head := p.head
-	p.mu.Unlock()
+func (p *PrimaryReplicator) register() (uint64, chan *WALEntry) {
+	id := p.nextID.Add(1)
+	ch := make(chan *WALEntry, replicaChanSize)
+	p.repMu.Lock()
+	p.replicas[id] = ch
+	p.repMu.Unlock()
+	return id, ch
+}
 
-	// ringStart is the oldest seq still held in the ring buffer.
-	ringStart := uint64(0)
-	if head > ringBufferSize {
-		ringStart = head - ringBufferSize
-	}
+func (p *PrimaryReplicator) unregister(id uint64) {
+	p.repMu.Lock()
+	delete(p.replicas, id)
+	p.repMu.Unlock()
+}
 
-	// Phase 1: WAL-file catch-up for the gap (fromSeq, ringStart).
-	if fromSeq+1 < ringStart {
-		slog.Info("primary: replica too far behind ring buffer; reading WAL file",
-			"replica", nodeID, "fromSeq", fromSeq, "ringStart", ringStart)
-		if err := p.catchUpFromWAL(stream, fromSeq, ringStart); err != nil {
-			slog.Warn("primary: WAL file catch-up failed", "replica", nodeID, "err", err)
-			return
+// serve registers a replica and streams to it on the calling goroutine.
+func (p *PrimaryReplicator) serve(fromSeq uint64, stream WALReplication_StreamWALServer) error {
+	id, ch := p.register()
+	defer p.unregister(id)
+	p.wg.Add(1)
+	defer p.wg.Done()
+	return p.streamToReplica(fromSeq, ch, stream)
+}
+
+// streamToReplica catches the replica up from fromSeq (WAL files, then ring),
+// then forwards live entries from ch until the stream or replicator ends.
+// ch must be registered before this is called so no entry appended during
+// catch-up is missed.
+func (p *PrimaryReplicator) streamToReplica(fromSeq uint64, ch <-chan *WALEntry, stream WALReplication_StreamWALServer) error {
+	lastSent := fromSeq
+	send := func(e *WALEntry, phase string) error {
+		if e.Seq <= lastSent {
+			return nil // already sent by an earlier, overlapping source
 		}
-	}
-
-	// Phase 2: ring-buffer catch-up for entries [max(ringStart, fromSeq+1), head).
-	startIdx := fromSeq + 1
-	if startIdx < ringStart {
-		startIdx = ringStart
-	}
-	for seq := startIdx; seq < head; seq++ {
-		p.mu.Lock()
-		entry := p.ring[seq%ringBufferSize]
-		p.mu.Unlock()
-		if entry == nil {
-			continue
-		}
-		if err := stream.Send(entry); err != nil {
-			slog.Warn("primary: send catch-up failed", "replica", nodeID, "err", err)
-			return
-		}
-	}
-
-	// Live-stream loop: forward new entries as they arrive.
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.stopCh:
-			return
-		case <-stream.Context().Done():
-			return
-		case entry := <-ch:
-			if err := stream.Send(entry); err != nil {
-				slog.Warn("primary: send entry failed", "replica", nodeID, "err", err)
-				return
+		if e.Seq != lastSent+1 {
+			if phase == "live" {
+				return status.Errorf(codes.Unavailable,
+					"replica fell behind: seq %d dropped (next available %d); reconnect to catch up", lastSent+1, e.Seq)
 			}
-		case <-ticker.C:
-			// Heartbeat keeps the gRPC stream alive across idle periods.
-			if err := stream.Send(&WALEntry{Op: "heartbeat"}); err != nil {
-				slog.Warn("primary: heartbeat failed", "replica", nodeID, "err", err)
-				return
-			}
-		}
-	}
-}
-
-// catchUpFromWAL reads the WAL file and streams every entry whose seq is in
-// the half-open range (fromSeq, upToSeq). Handles both binary (SWAL\x01) and
-// legacy NDJSON formats automatically.
-func (p *PrimaryReplicator) catchUpFromWAL(
-	stream WALReplication_StreamWALServer,
-	fromSeq, upToSeq uint64,
-) error {
-	f, err := os.Open(p.walPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("open WAL %s: %w", p.walPath, err)
-	}
-	defer f.Close()
-
-	// Detect binary vs JSON by peeking at first 5 bytes.
-	var peek [5]byte
-	n, _ := io.ReadFull(f, peek[:])
-	if n >= 5 && string(peek[:4]) == "SWAL" && peek[4] == 1 {
-		return p.catchUpBinaryWAL(stream, bufio.NewReaderSize(f, 1<<20), fromSeq, upToSeq)
-	}
-
-	// Legacy JSON format — seek back to beginning.
-	if _, serr := f.Seek(0, io.SeekStart); serr != nil {
-		return fmt.Errorf("seek WAL %s: %w", p.walPath, serr)
-	}
-	return p.catchUpJSONWAL(stream, f, fromSeq, upToSeq)
-}
-
-// catchUpJSONWAL handles the legacy NDJSON WAL format.
-func (p *PrimaryReplicator) catchUpJSONWAL(
-	stream WALReplication_StreamWALServer,
-	r io.Reader,
-	fromSeq, upToSeq uint64,
-) error {
-	const scanBuf = 4 << 20
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, scanBuf), scanBuf)
-
-	for scanner.Scan() {
-		var e walFileEntry
-		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
-			continue
-		}
-		if e.Seq <= fromSeq || e.Seq >= upToSeq {
-			continue
-		}
-		if err := stream.Send(&WALEntry{
-			Seq:      e.Seq,
-			Op:       e.Op,
-			DocId:    e.DocID,
-			Text:     e.Text,
-			Metadata: e.Metadata,
-		}); err != nil {
-			return err
-		}
-	}
-	return scanner.Err()
-}
-
-// catchUpBinaryWAL handles the binary WAL format.
-func (p *PrimaryReplicator) catchUpBinaryWAL(
-	stream WALReplication_StreamWALServer,
-	r io.Reader,
-	fromSeq, upToSeq uint64,
-) error {
-	var hdr [8]byte
-	for {
-		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			break // EOF or truncated tail
-		}
-		payloadLen := binary.LittleEndian.Uint32(hdr[0:4])
-		storedCRC := binary.LittleEndian.Uint32(hdr[4:8])
-
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			break
-		}
-		if crc32.ChecksumIEEE(payload) != storedCRC {
-			continue // corrupted record
-		}
-		e, err := walDecodeReplicationEntry(payload)
-		if err != nil {
-			continue
-		}
-		if e.Seq <= fromSeq || e.Seq >= upToSeq {
-			continue
+			return status.Errorf(codes.FailedPrecondition,
+				"shard %s: seqs %d..%d are no longer retained by the primary (flushed into segments); replica must be re-seeded",
+				p.shardID, lastSent+1, e.Seq-1)
 		}
 		if err := stream.Send(e); err != nil {
 			return err
 		}
+		lastSent = e.Seq
+		return nil
 	}
-	return nil
+
+	// Every seq up to lastAtStart must come from the WAL or the ring; later
+	// ones arrive on ch, which was registered before this read.
+	var lastAtStart uint64
+	if p.lastSeq != nil {
+		lastAtStart = p.lastSeq()
+	}
+
+	// Phase 1: WAL files.
+	if p.catchUp != nil {
+		if err := p.catchUp(lastSent, func(e *WALEntry) error { return send(e, "wal") }); err != nil {
+			return err
+		}
+	}
+
+	// Phase 2: ring buffer, for entries appended but not yet visible in the
+	// WAL scan. A slot holding a different seq was overwritten by a newer
+	// entry; the resulting hole is reported by send.
+	p.mu.Lock()
+	head := p.head
+	p.mu.Unlock()
+	start := lastSent + 1
+	if head > ringBufferSize && start < head-ringBufferSize {
+		start = head - ringBufferSize
+	}
+	for seq := start; seq < head; seq++ {
+		p.mu.Lock()
+		e := p.ring[seq%ringBufferSize]
+		p.mu.Unlock()
+		if e == nil || e.Seq != seq {
+			continue
+		}
+		if err := send(e, "ring"); err != nil {
+			return err
+		}
+	}
+
+	if lastSent < lastAtStart {
+		return status.Errorf(codes.FailedPrecondition,
+			"shard %s: seqs %d..%d are no longer retained by the primary (flushed into segments); replica must be re-seeded",
+			p.shardID, lastSent+1, lastAtStart)
+	}
+
+	// Phase 3: live entries. Heartbeats keep the stream alive when idle.
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			return nil
+		case <-stream.Context().Done():
+			return nil
+		case e := <-ch:
+			if err := send(e, "live"); err != nil {
+				return err
+			}
+		case <-ticker.C:
+			if err := stream.Send(&WALEntry{Op: "heartbeat"}); err != nil {
+				return err
+			}
+		}
+	}
 }
 
-// walDecodeReplicationEntry decodes a binary WAL payload into a WALEntry proto.
-// This is a local copy of the decode logic to avoid an import cycle with internal/search.
-func walDecodeReplicationEntry(b []byte) (*WALEntry, error) {
-	if len(b) < 17 {
-		return nil, fmt.Errorf("binary WAL record too short")
-	}
-	seq := binary.LittleEndian.Uint64(b[0:8])
-	// tsNano at b[8:16] — not used by replication stream
-	opByte := b[16]
-	b = b[17:]
-
-	e := &WALEntry{}
-
-	// docID (uint16 len prefix)
-	if len(b) < 2 {
-		return nil, fmt.Errorf("binary WAL: short docID len")
-	}
-	dlen := int(binary.LittleEndian.Uint16(b[0:2]))
-	b = b[2:]
-	if len(b) < dlen {
-		return nil, fmt.Errorf("binary WAL: short docID data")
-	}
-	e.DocId = string(b[:dlen])
-	b = b[dlen:]
-	e.Seq = seq
-
-	switch opByte {
-	case 1: // index
-		e.Op = "index"
-		if len(b) < 4 {
-			return nil, fmt.Errorf("binary WAL: short text len")
-		}
-		tlen := int(binary.LittleEndian.Uint32(b[0:4]))
-		b = b[4:]
-		if len(b) < tlen {
-			return nil, fmt.Errorf("binary WAL: short text data")
-		}
-		e.Text = string(b[:tlen])
-		// skip fields and metadata — not needed for replication stream
-	case 2: // delete
-		e.Op = "delete"
-	default:
-		return nil, fmt.Errorf("binary WAL: unknown op %d", opByte)
-	}
-	return e, nil
-}
-
-// Close shuts down the replicator.
+// Close stops all replica streams and waits for them to finish.
 func (p *PrimaryReplicator) Close() {
-	close(p.stopCh)
+	p.closeOnce.Do(func() { close(p.stopCh) })
 	p.wg.Wait()
 }
 
-// StreamWAL implements the WALReplication gRPC service method.
-func (p *PrimaryReplicator) StreamWAL(req *StreamRequest, stream WALReplication_StreamWALServer) error {
-	if req.ShardId != p.shardID {
-		return io.ErrUnexpectedEOF
+// Server is the WALReplication gRPC service for a node, dispatching each
+// StreamWAL call to the PrimaryReplicator of the requested shard.
+type Server struct {
+	UnimplementedWALReplicationServer
+
+	mu        sync.RWMutex
+	primaries map[string]*PrimaryReplicator
+}
+
+// NewServer creates an empty Server; add shards with Register.
+func NewServer() *Server {
+	return &Server{primaries: make(map[string]*PrimaryReplicator)}
+}
+
+// Register makes p's shard available to replicas.
+func (s *Server) Register(p *PrimaryReplicator) {
+	s.mu.Lock()
+	s.primaries[p.shardID] = p
+	s.mu.Unlock()
+}
+
+// StreamWAL implements WALReplicationServer.
+func (s *Server) StreamWAL(req *StreamRequest, stream WALReplication_StreamWALServer) error {
+	s.mu.RLock()
+	p := s.primaries[req.ShardId]
+	s.mu.RUnlock()
+	if p == nil {
+		return status.Errorf(codes.NotFound, "shard %q is not served by this primary", req.ShardId)
 	}
-	nodeID := req.ShardId + "-replica"
-	p.AddReplica(nodeID, req.FromSeq, stream)
-	// Block until the stream context is cancelled.
-	<-stream.Context().Done()
-	return context.Cause(stream.Context())
+	slog.Info("primary: replica connected", "shard", req.ShardId, "from_seq", req.FromSeq)
+	return p.serve(req.FromSeq, stream)
+}
+
+// PrimaryStatus is a point-in-time view of a primary shard, for /health.
+type PrimaryStatus struct {
+	ShardID  string `json:"shard_id"`
+	HeadSeq  uint64 `json:"head_seq"`
+	Replicas int    `json:"replicas"`
+}
+
+// Status returns the shard's current replication state.
+func (p *PrimaryReplicator) Status() PrimaryStatus {
+	return PrimaryStatus{ShardID: p.shardID, HeadSeq: p.HeadSeq(), Replicas: p.ReplicaCount()}
 }

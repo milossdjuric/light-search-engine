@@ -19,9 +19,10 @@ message StreamRequest {
 // WALEntry mirrors the NDJSON WAL format.
 message WALEntry {
   uint64 seq      = 1;
-  string op       = 2;  // "index" | "delete"
+  string op       = 2;  // "index" | "delete" | "reset" | "heartbeat"
   string doc_id   = 3;
   string text     = 4;
   map<string, string> metadata = 5;
   int64  ts_unix  = 6;  // Unix nanoseconds
+  map<string, string> fields = 7;  // per-field text for BM25F indexing
 }

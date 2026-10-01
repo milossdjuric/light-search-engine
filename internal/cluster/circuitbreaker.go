@@ -120,11 +120,3 @@ func (cb *CircuitBreaker) State() string {
 	}
 	return "unknown"
 }
-
-// IsOpen returns true when the breaker is open (fast-failing).
-func (cb *CircuitBreaker) IsOpen() bool {
-	cb.mu.Lock()
-	s := cb.state
-	cb.mu.Unlock()
-	return s == cbOpen
-}

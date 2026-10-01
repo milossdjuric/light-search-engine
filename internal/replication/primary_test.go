@@ -41,7 +41,7 @@ func newFakeStream() *fakeServerStream {
 // catch-up request (fromSeq=0) delivers every entry currently held in the
 // ring buffer, including the very first one appended.
 func TestStreamToReplicaCatchUpSendsAllRingEntries(t *testing.T) {
-	p := NewPrimaryReplicator("shard0", "/nonexistent/wal")
+	p := NewPrimaryReplicator("shard0", nil)
 
 	for seq := uint64(1); seq <= 3; seq++ {
 		p.Append(&WALEntry{Seq: seq, Op: "index", DocId: "d"})
@@ -50,7 +50,7 @@ func TestStreamToReplicaCatchUpSendsAllRingEntries(t *testing.T) {
 	fake := newFakeStream()
 	stream := &grpc.GenericServerStream[struct{}, WALEntry]{ServerStream: fake}
 
-	p.streamToReplica("node1", 0, make(chan *WALEntry), stream)
+	p.streamToReplica(0, make(chan *WALEntry), stream)
 
 	var gotSeqs []uint64
 	for _, e := range fake.sent {
@@ -74,7 +74,7 @@ func TestStreamToReplicaCatchUpSendsAllRingEntries(t *testing.T) {
 // streamToReplica's ring read (p.ring[seq%ringBufferSize]) must take p.mu
 // like Append's write does; run with -race to catch a torn read otherwise.
 func TestRingBufferReadDuringConcurrentAppendIsRaceFree(t *testing.T) {
-	p := NewPrimaryReplicator("shard-race", "/nonexistent/wal")
+	p := NewPrimaryReplicator("shard-race", nil)
 
 	for seq := uint64(1); seq <= ringBufferSize; seq++ {
 		p.Append(&WALEntry{Seq: seq, Op: "index", DocId: "d"})
@@ -91,6 +91,6 @@ func TestRingBufferReadDuringConcurrentAppendIsRaceFree(t *testing.T) {
 		}
 	}()
 
-	p.streamToReplica("racer", 0, make(chan *WALEntry), stream)
+	p.streamToReplica(0, make(chan *WALEntry), stream)
 	<-done
 }

@@ -1,0 +1,3 @@
+# Leftover Rust build output from before the native kernels moved to C++
+# (internal/retrieval/index/*.cpp); not needed in the image.
+native/

@@ -34,7 +34,9 @@ import csv
 import io
 import json
 import math
+import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -226,8 +228,14 @@ def reset_index(server_url):
     r = requests.post(f"{server_url}/admin/reset", timeout=30)
     r.raise_for_status()
 
-def ingest_corpus(server_url, corpus_iter, batch_size=500, show_progress=True):
-    """Ingest docs via /index/bulk, then flush + merge. Returns doc count."""
+def ingest_corpus(server_url, corpus_iter, batch_size=1000, show_progress=True):
+    """Ingest docs via /index/bulk until searchable and durable, then force-merge.
+
+    Timed: bulk requests + /index/flush (docs written to segments on disk) —
+    the same end state as ES's timed bulk + _refresh + _flush. The force-merge
+    to 1 segment per shard is untimed, like ES's _forcemerge.
+    Returns (doc count, timed seconds).
+    """
     s = requests.Session()
     buf = []
     ingested = 0
@@ -251,26 +259,31 @@ def ingest_corpus(server_url, corpus_iter, batch_size=500, show_progress=True):
         s.post(f"{server_url}/index/bulk", data=ndjson,
                headers={"Content-Type": "application/x-ndjson"}).raise_for_status()
         ingested += len(buf)
+    s.post(f"{server_url}/index/flush").raise_for_status()
 
     elapsed = time.time() - t0
-    print(f"  Indexed {ingested:,} docs in {elapsed:.1f}s ({ingested/elapsed:.0f} docs/s)")
+    print(f"  Indexed {ingested:,} docs in {elapsed:.1f}s ({ingested/elapsed:.0f} docs/s, incl. flush)")
 
-    print("  Flushing + merging...")
-    s.post(f"{server_url}/index/flush").raise_for_status()
-    s.post(f"{server_url}/index/merge").raise_for_status()
-
-    # Wait for merge to settle (poll /health until warm=true)
-    deadline = time.time() + 120
+    # Untimed: force-merge to 1 segment per shard (as ES _forcemerge below).
+    # The request can outlive the server's write timeout on big corpora, so
+    # also poll /shards until every shard reports a single segment.
+    print("  Force-merging to 1 segment per shard...")
+    try:
+        s.post(f"{server_url}/index/merge", params={"max_segments": 1}, timeout=600)
+    except requests.RequestException as e:
+        print(f"  (merge request ended early: {e}; polling)")
+    deadline = time.time() + 600
     while time.time() < deadline:
         try:
+            shards = requests.get(f"{server_url}/shards", timeout=5).json()
             h = requests.get(f"{server_url}/health", timeout=5).json()
-            if h.get("warm"):
+            if all(sh.get("segments", 0) <= 1 for sh in shards) and h.get("warm"):
                 break
         except Exception:
             pass
-        time.sleep(2)
+        time.sleep(1)
 
-    return ingested
+    return ingested, elapsed
 
 # Elasticsearch ingest + search
 
@@ -278,19 +291,25 @@ def reset_es(es_url, index_name):
     """Delete the Elasticsearch index if it exists."""
     requests.delete(f"{es_url}/{index_name}", timeout=10)
 
-def ingest_es(es_url, index_name, corpus_iter, batch_size=2000, show_progress=True):
-    """Ingest docs into Elasticsearch via bulk API. Returns doc count."""
+def ingest_es(es_url, index_name, corpus_iter, batch_size=1000, shards=4, show_progress=True):
+    """Ingest docs into Elasticsearch until searchable and durable, then force-merge.
+
+    Timed: bulk requests + _refresh + _flush (matches our bulk + /index/flush).
+    ES's default translog durability ("request") fsyncs every bulk request,
+    like our wal_durability: sync. The force-merge is untimed.
+    Returns (doc count, timed seconds).
+    """
     s = requests.Session()
     mapping = {
         "settings": {
-            "number_of_shards": 1,
+            "number_of_shards": shards,
             "number_of_replicas": 0,
             "refresh_interval": "-1",       # disable auto-refresh during ingest
             "similarity": {"default": {"type": "BM25", "k1": 1.2, "b": 0.75}},
         },
+        # One text field (title + body), exactly what our engine indexes.
         "mappings": {"properties": {
-            "text":  {"type": "text", "analyzer": "standard"},
-            "title": {"type": "text", "analyzer": "standard"},
+            "text": {"type": "text", "analyzer": "standard"},
         }},
     }
     r = s.put(f"{es_url}/{index_name}", json=mapping)
@@ -301,6 +320,13 @@ def ingest_es(es_url, index_name, corpus_iter, batch_size=2000, show_progress=Tr
     ingested = 0
     t0 = time.time()
     it = tqdm(corpus_iter, desc="  [ES] ingesting", unit="doc") if show_progress else corpus_iter
+
+    def send(lines):
+        body = "\n".join(lines) + "\n"
+        s.post(f"{es_url}/{index_name}/_bulk",
+               data=body.encode(), headers={"Content-Type": "application/x-ndjson"},
+               timeout=120).raise_for_status()
+
     for doc in it:
         text = doc.get("title", "")
         if text:
@@ -310,35 +336,43 @@ def ingest_es(es_url, index_name, corpus_iter, batch_size=2000, show_progress=Tr
         buf.append(json.dumps({"index": {"_id": doc["id"]}}))
         buf.append(json.dumps({"text": text}))
         if len(buf) >= batch_size * 2:
-            body = "\n".join(buf) + "\n"
-            r = s.post(f"{es_url}/{index_name}/_bulk",
-                       data=body.encode(), headers={"Content-Type": "application/x-ndjson"},
-                       timeout=120)
-            r.raise_for_status()
+            send(buf)
             ingested += len(buf) // 2
             buf = []
     if buf:
-        body = "\n".join(buf) + "\n"
-        s.post(f"{es_url}/{index_name}/_bulk",
-               data=body.encode(), headers={"Content-Type": "application/x-ndjson"},
-               timeout=120).raise_for_status()
+        send(buf)
         ingested += len(buf) // 2
-    # Re-enable refresh and force a final refresh
+    s.post(f"{es_url}/{index_name}/_refresh", timeout=120).raise_for_status()
+    s.post(f"{es_url}/{index_name}/_flush", timeout=120).raise_for_status()
+    elapsed = time.time() - t0
+    print(f"  [ES] Indexed {ingested:,} docs in {elapsed:.1f}s ({ingested/elapsed:.0f} docs/s, incl. refresh+flush)")
+
+    # Untimed: force-merge to 1 segment per shard, then restore normal refresh.
+    print("  [ES] Force-merging to 1 segment per shard...")
+    s.post(f"{es_url}/{index_name}/_forcemerge", params={"max_num_segments": 1}, timeout=600).raise_for_status()
     s.put(f"{es_url}/{index_name}/_settings",
           json={"index": {"refresh_interval": "1s"}}).raise_for_status()
-    s.post(f"{es_url}/{index_name}/_refresh", timeout=60).raise_for_status()
-    elapsed = time.time() - t0
-    print(f"  [ES] Indexed {ingested:,} docs in {elapsed:.1f}s ({ingested/elapsed:.0f} docs/s)")
-    return ingested
+    s.post(f"{es_url}/{index_name}/_refresh", timeout=120).raise_for_status()
+    return ingested, elapsed
+
+# One keep-alive HTTP session per worker thread, for both engines, so neither
+# pays a TCP connect per query.
+_tls = threading.local()
+
+def _session():
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = _tls.session = requests.Session()
+    return s
 
 def search_es(es_url, index_name, query, top_k, timeout=30):
     """Query Elasticsearch and return ordered list of doc IDs."""
     body = {
-        "query": {"multi_match": {"query": query, "fields": ["text", "title"]}},
+        "query": {"match": {"text": query}},   # single field, as our engine
         "size": top_k,
         "_source": False,
     }
-    r = requests.post(f"{es_url}/{index_name}/_search", json=body, timeout=timeout)
+    r = _session().post(f"{es_url}/{index_name}/_search", json=body, timeout=timeout)
     r.raise_for_status()
     return [hit["_id"] for hit in r.json()["hits"]["hits"]]
 
@@ -391,9 +425,9 @@ def run_eval_es(es_url, index_name, queries, qrels, top_k, workers):
 # Search
 
 def search(server_url, query, top_k, timeout=30):
-    r = requests.get(f"{server_url}/search",
-                     params={"q": query, "top_k": top_k, "no_snippet": "1"},
-                     timeout=timeout)
+    r = _session().get(f"{server_url}/search",
+                       params={"q": query, "top_k": top_k, "no_snippet": "1"},
+                       timeout=timeout)
     r.raise_for_status()
     return [hit["doc_id"] for hit in r.json().get("results", [])]
 
@@ -489,6 +523,12 @@ def main():
                         help=f"Elasticsearch base URL (default: {ES_URL})")
     parser.add_argument("--es-skip-ingest", action="store_true",
                         help="skip ES ingest (dataset already loaded in ES)")
+    parser.add_argument("--es-shards", type=int, default=4,
+                        help="ES primary shards; match the engine's index.num_shards (default: 4)")
+    parser.add_argument("--batch-size", type=int, default=1000,
+                        help="docs per bulk request, same for both engines (default: 1000)")
+    parser.add_argument("--no-warmup", action="store_true",
+                        help="skip the untimed warm-up pass over all queries before measuring")
     args = parser.parse_args()
 
     dataset_names = [d.strip() for d in args.datasets.split(",")]
@@ -499,6 +539,8 @@ def main():
         sys.exit(1)
 
     print(f"\nBEIR evaluation — datasets: {dataset_names}")
+    print(f"Fairness: ES shards={args.es_shards} | batch={args.batch_size} docs/bulk | "
+          f"warm-up={'off' if args.no_warmup else 'on'} | both force-merged to 1 segment/shard")
     print(f"Server: {args.server} | top_k={args.top_k} | workers={args.workers}")
     if args.compare_es:
         print(f"Elasticsearch: {args.es_url}")
@@ -523,6 +565,7 @@ def main():
 
         # Load corpus into memory once (shared between our engine and ES).
         corpus_docs = None
+        ours_ingest = es_ingest = None  # (docs, timed seconds)
 
         if not args.skip_ingest:
             print("  Loading corpus from HuggingFace...")
@@ -540,7 +583,7 @@ def main():
             except Exception as e:
                 print(f"  WARN: reset failed ({e}), continuing anyway")
             try:
-                ingest_corpus(args.server, iter(corpus_docs))
+                ours_ingest = ingest_corpus(args.server, iter(corpus_docs), batch_size=args.batch_size)
             except Exception as e:
                 print(f"  ERROR during ingest: {e}")
                 import traceback; traceback.print_exc()
@@ -555,7 +598,8 @@ def main():
                 except Exception as e:
                     print(f"  WARN: ES reset failed ({e}), continuing anyway")
                 try:
-                    ingest_es(args.es_url, index_name, iter(corpus_docs))
+                    es_ingest = ingest_es(args.es_url, index_name, iter(corpus_docs),
+                                          batch_size=args.batch_size, shards=args.es_shards)
                 except Exception as e:
                     print(f"  ERROR during ES ingest: {e}")
                     import traceback; traceback.print_exc()
@@ -572,6 +616,10 @@ def main():
 
         # Eval — our engine
         print(f"\n  [Our engine] Running {len(queries)} queries (workers={args.workers})...")
+        if not args.no_warmup:
+            print("  [Our engine] warm-up pass (untimed)...")
+            run_eval(args.server, queries, qrels, args.top_k, args.workers)
+        load_before = os.getloadavg()[0]
         metrics = run_eval(args.server, queries, qrels, args.top_k, args.workers)
 
         # Eval — Elasticsearch
@@ -580,6 +628,9 @@ def main():
             index_name = dataset_name.replace("-", "_")
             print(f"  [ES] Running {len(queries)} queries (workers={args.workers})...")
             try:
+                if not args.no_warmup:
+                    print("  [ES] warm-up pass (untimed)...")
+                    run_eval_es(args.es_url, index_name, queries, qrels, args.top_k, args.workers)
                 es_metrics = run_eval_es(args.es_url, index_name, queries, qrels,
                                          args.top_k, args.workers)
             except Exception as e:
@@ -626,6 +677,9 @@ def main():
             "bm25_baseline": baseline,
             **{f"ours_{k}": v for k, v in metrics.items()},
             **({"es_" + k: v for k, v in es_metrics.items()} if es_metrics else {}),
+            "load_avg_1m":   load_before,
+            **({"ours_ingest_s": ours_ingest[1], "ours_ingest_docs_s": ours_ingest[0] / ours_ingest[1]} if ours_ingest else {}),
+            **({"es_ingest_s": es_ingest[1], "es_ingest_docs_s": es_ingest[0] / es_ingest[1]} if es_ingest else {}),
         }
 
     # Summary table
@@ -677,6 +731,17 @@ def main():
             macro_ndcg = np.mean([r.get("ours_ndcg10", r.get("ndcg10", 0)) for r in all_results.values()])
             print(f"Macro-avg nDCG@10 across {len(all_results)} datasets: {macro_ndcg:.4f}")
             print()
+
+    # Indexing speed (timed until searchable + durable on both sides)
+    if any("ours_ingest_s" in r for r in all_results.values()):
+        print(f"{'Dataset':<15} {'Ours ingest':>12} {'ES ingest':>11} {'Ours docs/s':>12} {'ES docs/s':>10} {'load avg':>9}")
+        for name, r in all_results.items():
+            if "ours_ingest_s" not in r:
+                continue
+            es_s = f"{r['es_ingest_s']:.1f}s" if "es_ingest_s" in r else "n/a"
+            es_d = f"{r['es_ingest_docs_s']:.0f}" if "es_ingest_docs_s" in r else "n/a"
+            print(f"{name:<15} {r['ours_ingest_s']:>11.1f}s {es_s:>11} {r['ours_ingest_docs_s']:>12.0f} {es_d:>10} {r['load_avg_1m']:>9.1f}")
+        print()
 
     # Save JSON
     Path(args.output).write_text(json.dumps(all_results, indent=2))

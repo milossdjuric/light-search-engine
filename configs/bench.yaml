@@ -4,11 +4,13 @@ server:
   mode: "shard"
 
 storage:
-  path: "data/manifest.json"
   data_dir: "data"
 
 index:
   num_shards: 4
+  # fsync the WAL once per bulk request, matching Elasticsearch's default
+  # translog durability ("request") so indexing speed compares like for like.
+  wal_durability: "sync"
   mem_threshold_mb: 512
   max_buffer_docs: 100000
   bm25_k1: 1.2
@@ -18,7 +20,6 @@ index:
   max_merge_size_mb: 256
   merge_rate_limit_mbps: 80
   merge_io_burst_mb: 64
-  segment_compression: ""
   bloom_fp_rate: 0.01
   merge_on_startup: true
   startup_merge_target: 2
@@ -34,7 +35,9 @@ index:
 search:
   global_fusion: "score"
   default_top_k: 10
-  query_cache_size: 1000
+  # Off for benchmarks: the harness repeats every query in an untimed warm-up
+  # pass, and ES does not cache queries that return hits (size > 0).
+  query_cache_size: 0
   doc_cache_size: 50000
 
 logging:

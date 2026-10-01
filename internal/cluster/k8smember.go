@@ -172,8 +172,8 @@ type endpointSubset struct {
 }
 
 type endpointAddress struct {
-	IP        string         `json:"ip"`
-	TargetRef *objectRef     `json:"targetRef"`
+	IP        string     `json:"ip"`
+	TargetRef *objectRef `json:"targetRef"`
 }
 
 type objectRef struct {
@@ -205,7 +205,7 @@ func (w *K8sMemberWatcher) rebuild(ctx context.Context, ep *endpointOrError) {
 			httpAddr := addr.IP + ":" + strconv.Itoa(httpPort)
 			grpcAddr := addr.IP + ":" + strconv.Itoa(w.cfg.GRPCPort)
 
-			shards, err := w.probeLocalShards(ctx, httpAddr)
+			shards, err := ProbeLocalShards(ctx, w.client, httpAddr)
 			if err != nil {
 				slog.Warn("k8smember: probe failed, skipping node",
 					"node", nodeID, "addr", httpAddr, "err", err)
@@ -234,8 +234,9 @@ type healthProbeResponse struct {
 	LocalShards []int `json:"local_shards"`
 }
 
-// probeLocalShards calls GET /health on the given addr and returns local_shards.
-func (w *K8sMemberWatcher) probeLocalShards(ctx context.Context, addr string) ([]int, error) {
+// ProbeLocalShards calls GET /health on a shard node at addr (host:port) and
+// returns the shard IDs it reports in local_shards.
+func ProbeLocalShards(ctx context.Context, client *http.Client, addr string) ([]int, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -244,7 +245,7 @@ func (w *K8sMemberWatcher) probeLocalShards(ctx context.Context, addr string) ([
 	if err != nil {
 		return nil, err
 	}
-	resp, err := w.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

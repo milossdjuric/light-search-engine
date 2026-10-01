@@ -29,7 +29,8 @@ func (f *fakeEntryReceiver) Recv() (*WALEntry, error) {
 // backlog must not be applied ahead of it.
 func TestApplyStreamStopsOnApplyErrorWithoutAdvancingAppliedSeq(t *testing.T) {
 	var appliedDocIDs []string
-	r := NewReplicaApplier("shard0", "unused", func(op, docID, text string, metadata map[string]string) error {
+	r := NewReplicaApplier("shard0", "unused", func(e *WALEntry) error {
+		docID := e.DocId
 		if docID == "fail" {
 			return errors.New("boom")
 		}
@@ -65,7 +66,8 @@ func TestApplyStreamStopsOnApplyErrorWithoutAdvancingAppliedSeq(t *testing.T) {
 // catch-up phase resend the missing entry.
 func TestApplyStreamDetectsSequenceGapAndForcesResync(t *testing.T) {
 	var appliedDocIDs []string
-	r := NewReplicaApplier("shard0", "unused", func(op, docID, text string, metadata map[string]string) error {
+	r := NewReplicaApplier("shard0", "unused", func(e *WALEntry) error {
+		docID := e.DocId
 		appliedDocIDs = append(appliedDocIDs, docID)
 		return nil
 	})

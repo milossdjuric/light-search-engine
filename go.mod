@@ -12,7 +12,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.9
 	github.com/kljensen/snowball v0.10.0
 	github.com/pierrec/lz4/v4 v4.1.26
-	github.com/ronanh/intcomp v1.1.1
 	golang.org/x/time v0.15.0
 	google.golang.org/grpc v1.79.2
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af

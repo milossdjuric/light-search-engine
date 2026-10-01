@@ -79,11 +79,12 @@ func (x *StreamRequest) GetFromSeq() uint64 {
 type WALEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Seq           uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
-	Op            string                 `protobuf:"bytes,2,opt,name=op,proto3" json:"op,omitempty"` // "index" | "delete"
+	Op            string                 `protobuf:"bytes,2,opt,name=op,proto3" json:"op,omitempty"` // "index" | "delete" | "reset" | "heartbeat"
 	DocId         string                 `protobuf:"bytes,3,opt,name=doc_id,json=docId,proto3" json:"doc_id,omitempty"`
 	Text          string                 `protobuf:"bytes,4,opt,name=text,proto3" json:"text,omitempty"`
 	Metadata      map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	TsUnix        int64                  `protobuf:"varint,6,opt,name=ts_unix,json=tsUnix,proto3" json:"ts_unix,omitempty"` // Unix nanoseconds
+	TsUnix        int64                  `protobuf:"varint,6,opt,name=ts_unix,json=tsUnix,proto3" json:"ts_unix,omitempty"`                                                            // Unix nanoseconds
+	Fields        map[string]string      `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // per-field text for BM25F indexing
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -160,6 +161,13 @@ func (x *WALEntry) GetTsUnix() int64 {
 	return 0
 }
 
+func (x *WALEntry) GetFields() map[string]string {
+	if x != nil {
+		return x.Fields
+	}
+	return nil
+}
+
 var File_internal_replication_replication_proto protoreflect.FileDescriptor
 
 const file_internal_replication_replication_proto_rawDesc = "" +
@@ -167,15 +175,19 @@ const file_internal_replication_replication_proto_rawDesc = "" +
 	"&internal/replication/replication.proto\x12\vreplication\"E\n" +
 	"\rStreamRequest\x12\x19\n" +
 	"\bshard_id\x18\x01 \x01(\tR\ashardId\x12\x19\n" +
-	"\bfrom_seq\x18\x02 \x01(\x04R\afromSeq\"\xee\x01\n" +
+	"\bfrom_seq\x18\x02 \x01(\x04R\afromSeq\"\xe4\x02\n" +
 	"\bWALEntry\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x0e\n" +
 	"\x02op\x18\x02 \x01(\tR\x02op\x12\x15\n" +
 	"\x06doc_id\x18\x03 \x01(\tR\x05docId\x12\x12\n" +
 	"\x04text\x18\x04 \x01(\tR\x04text\x12?\n" +
 	"\bmetadata\x18\x05 \x03(\v2#.replication.WALEntry.MetadataEntryR\bmetadata\x12\x17\n" +
-	"\ats_unix\x18\x06 \x01(\x03R\x06tsUnix\x1a;\n" +
+	"\ats_unix\x18\x06 \x01(\x03R\x06tsUnix\x129\n" +
+	"\x06fields\x18\a \x03(\v2!.replication.WALEntry.FieldsEntryR\x06fields\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
+	"\vFieldsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x012R\n" +
 	"\x0eWALReplication\x12@\n" +
@@ -193,21 +205,23 @@ func file_internal_replication_replication_proto_rawDescGZIP() []byte {
 	return file_internal_replication_replication_proto_rawDescData
 }
 
-var file_internal_replication_replication_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_internal_replication_replication_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_internal_replication_replication_proto_goTypes = []any{
 	(*StreamRequest)(nil), // 0: replication.StreamRequest
 	(*WALEntry)(nil),      // 1: replication.WALEntry
 	nil,                   // 2: replication.WALEntry.MetadataEntry
+	nil,                   // 3: replication.WALEntry.FieldsEntry
 }
 var file_internal_replication_replication_proto_depIdxs = []int32{
 	2, // 0: replication.WALEntry.metadata:type_name -> replication.WALEntry.MetadataEntry
-	0, // 1: replication.WALReplication.StreamWAL:input_type -> replication.StreamRequest
-	1, // 2: replication.WALReplication.StreamWAL:output_type -> replication.WALEntry
-	2, // [2:3] is the sub-list for method output_type
-	1, // [1:2] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	3, // 1: replication.WALEntry.fields:type_name -> replication.WALEntry.FieldsEntry
+	0, // 2: replication.WALReplication.StreamWAL:input_type -> replication.StreamRequest
+	1, // 3: replication.WALReplication.StreamWAL:output_type -> replication.WALEntry
+	3, // [3:4] is the sub-list for method output_type
+	2, // [2:3] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_internal_replication_replication_proto_init() }
@@ -221,7 +235,7 @@ func file_internal_replication_replication_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_replication_replication_proto_rawDesc), len(file_internal_replication_replication_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

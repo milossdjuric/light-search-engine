@@ -33,7 +33,7 @@ func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
 		}
 		done(false) // report failure
 	}
-	if !cb.IsOpen() {
+	if cb.State() != "open" {
 		t.Error("after 3 failures: circuit breaker should be open")
 	}
 	// Subsequent requests must be rejected.
@@ -56,7 +56,7 @@ func TestCircuitBreakerHalfOpenAfterTimeout(t *testing.T) {
 	}
 	done(false)
 
-	if !cb.IsOpen() {
+	if cb.State() != "open" {
 		t.Fatal("breaker should be open after failure")
 	}
 
@@ -106,7 +106,7 @@ func TestCircuitBreakerHalfOpenProbeExclusivity(t *testing.T) {
 		done2    func(bool)
 	)
 
-	var readyWg sync.WaitGroup // signals main that both goroutines are blocked
+	var readyWg sync.WaitGroup   // signals main that both goroutines are blocked
 	var releaseWg sync.WaitGroup // main signals goroutines to proceed
 	readyWg.Add(2)
 	releaseWg.Add(1)
@@ -121,7 +121,7 @@ func TestCircuitBreakerHalfOpenProbeExclusivity(t *testing.T) {
 		allowed1 = a
 		done1 = d
 		mu.Unlock()
-		readyWg.Done()  // notify main we have our result
+		readyWg.Done()   // notify main we have our result
 		releaseWg.Wait() // wait until main says both are ready
 		if d != nil {
 			d(true)
@@ -182,7 +182,7 @@ func TestCircuitBreakerProbeFailureReopens(t *testing.T) {
 	}
 	// Probe fails → breaker must reopen.
 	done(false)
-	if !cb.IsOpen() {
+	if cb.State() != "open" {
 		t.Error("after probe failure: circuit breaker should reopen")
 	}
 }
@@ -218,7 +218,7 @@ func TestCircuitBreakerFailureCountResets(t *testing.T) {
 		done(false)
 	}
 
-	if cb.IsOpen() {
+	if cb.State() == "open" {
 		t.Error("breaker should still be closed: only 2 consecutive failures after reset")
 	}
 }

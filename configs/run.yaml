@@ -4,11 +4,10 @@ server:
   mode: "shard"
 
 storage:
-  path: "data/manifest.json"
   data_dir: "data"
 
 index:
-  num_shards: 1                  # MUST match existing data; changing this requires full re-index
+  num_shards: 4                  # MUST match existing data; changing this requires full re-index
   mem_threshold_mb: 512
   max_buffer_docs: 100000
   buffer_pool_size: 4
@@ -24,7 +23,6 @@ index:
   warmup_mode: "full"
   warmup_tier_threshold_mb: 1000
   warmup_top_terms: 1000
-  segment_compression: ""
   bloom_fp_rate: 0.01
   stopwords:
     enabled: false
@@ -40,6 +38,3 @@ search:
 logging:
   level: "info"
   format: "text"
-
-object_store:
-  driver: "local"

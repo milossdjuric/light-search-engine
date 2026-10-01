@@ -34,6 +34,7 @@ type Client struct {
 	httpCli        *http.Client
 	fusionMode     string // "score" | "rrf"
 	totalShards    int
+	apiKey         string // forwarded as "Authorization: Bearer <key>" on shard write requests
 }
 
 // NewClient creates a coordinator Client.
@@ -46,6 +47,18 @@ func NewClient(ring *Ring, fusionMode string, vnodes int) *Client {
 		httpCli:        &http.Client{Timeout: httpTimeout},
 		fusionMode:     fusionMode,
 		totalShards:    ring.TotalShards(),
+	}
+}
+
+// SetAPIKey sets the key forwarded to shard nodes on write requests
+// (IndexDoc, DeleteDoc). Shards and coordinator are expected to share one
+// server.api_key; an empty key sends no Authorization header.
+func (c *Client) SetAPIKey(key string) { c.apiKey = key }
+
+// setAuth attaches the API key to a shard write request when one is set.
+func (c *Client) setAuth(req *http.Request) {
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 }
 
@@ -123,7 +136,102 @@ func (c *Client) IndexDoc(ctx context.Context, doc types.Document) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
 	return c.doWithDone(req, done)
+}
+
+// IndexBatch indexes docs by sending one NDJSON /index/bulk request per shard
+// node (in parallel across nodes) instead of one request per document. Each
+// shard's node is chosen as in IndexDoc (primary, else a replica whose circuit
+// breaker allows it). It returns how many docs the nodes indexed and how many
+// failed; a node that errors counts its whole batch as failed.
+func (c *Client) IndexBatch(ctx context.Context, docs []types.Document) (indexed, failed int) {
+	type nodeBatch struct {
+		node  *NodeMeta
+		dones []func(bool)
+		docs  []types.Document
+	}
+	byShard := make(map[int][]types.Document)
+	for _, d := range docs {
+		s := c.shardFor(d.ID)
+		byShard[s] = append(byShard[s], d)
+	}
+	byNode := make(map[string]*nodeBatch)
+	for shard, shardDocs := range byShard {
+		node, done, _, err := c.nodeFor(shard)
+		if err != nil {
+			slog.Error("client: IndexBatch no node for shard", "shard", shard, "docs", len(shardDocs), "err", err)
+			failed += len(shardDocs)
+			continue
+		}
+		b := byNode[node.NodeID]
+		if b == nil {
+			b = &nodeBatch{node: node}
+			byNode[node.NodeID] = b
+		}
+		b.dones = append(b.dones, done)
+		b.docs = append(b.docs, shardDocs...)
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, b := range byNode {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n, err := c.postBulk(ctx, b.node, b.docs)
+			for _, d := range b.dones {
+				d(err == nil)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				slog.Error("client: IndexBatch node failed", "node", b.node.NodeID, "docs", len(b.docs), "err", err)
+				failed += len(b.docs)
+				return
+			}
+			indexed += n.Indexed
+			failed += n.Failed
+		}()
+	}
+	wg.Wait()
+	return indexed, failed
+}
+
+type bulkResult struct {
+	Indexed int `json:"indexed"`
+	Failed  int `json:"failed"`
+}
+
+// postBulk sends docs to node's /index/bulk as NDJSON.
+func (c *Client) postBulk(ctx context.Context, node *NodeMeta, docs []types.Document) (bulkResult, error) {
+	var body bytes.Buffer
+	enc := json.NewEncoder(&body)
+	for _, d := range docs {
+		if err := enc.Encode(d); err != nil {
+			return bulkResult{}, err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+node.HTTPAddr+"/index/bulk", &body)
+	if err != nil {
+		return bulkResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	c.setAuth(req)
+	resp, err := c.httpCli.Do(req)
+	if err != nil {
+		return bulkResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return bulkResult{}, fmt.Errorf("client: node returned %d", resp.StatusCode)
+	}
+	var r bulkResult
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return bulkResult{}, fmt.Errorf("client: decode bulk response: %w", err)
+	}
+	return r, nil
 }
 
 // DeleteDoc routes a delete to the owning shard.
@@ -139,6 +247,7 @@ func (c *Client) DeleteDoc(ctx context.Context, docID string) error {
 		done(false)
 		return err
 	}
+	c.setAuth(req)
 	return c.doWithDone(req, done)
 }
 
@@ -158,25 +267,25 @@ type shardSearchResponse struct {
 }
 
 // Search fans out to all shards.
-func (c *Client) Search(ctx context.Context, query string, topK int, retriever, fusion string) ([]types.SearchResult, bool, error) {
+func (c *Client) Search(ctx context.Context, query string, topK int, retriever string, noSnippet bool) ([]types.SearchResult, bool, error) {
 	switch c.fusionMode {
 	case "rrf":
-		return c.searchRRF(ctx, query, topK, retriever, fusion)
+		return c.searchRRF(ctx, query, topK, retriever, noSnippet)
 	default: // "score"
-		return c.searchScore(ctx, query, topK, retriever, fusion)
+		return c.searchScore(ctx, query, topK, retriever, noSnippet)
 	}
 }
 
 // searchRRF fans out to all nodes in parallel, collects per-node top-K results,
 // and merges with Reciprocal Rank Fusion.
-func (c *Client) searchRRF(ctx context.Context, query string, topK int, retriever, fusion string) ([]types.SearchResult, bool, error) {
+func (c *Client) searchRRF(ctx context.Context, query string, topK int, retriever string, noSnippet bool) ([]types.SearchResult, bool, error) {
 	nodes := c.ring.Nodes()
 	results := make(chan searchNodeResult, len(nodes))
 
 	for _, n := range nodes {
 		n := n
 		go func() {
-			docs, degraded, err := c.searchNode(ctx, n, query, topK, retriever, fusion)
+			docs, degraded, err := c.searchNode(ctx, n, query, topK, retriever, noSnippet)
 			results <- searchNodeResult{nodeID: n.NodeID, docs: docs, degraded: degraded, err: err}
 		}()
 	}
@@ -211,7 +320,7 @@ func (c *Client) searchRRF(ctx context.Context, query string, topK int, retrieve
 // searchScore fans out to all nodes in parallel, each scoring with its local IDF,
 // and merges by raw score. With uniform FNV routing local IDF == global IDF so
 // scores are directly comparable across nodes. Matches ES query_then_fetch.
-func (c *Client) searchScore(ctx context.Context, query string, topK int, retriever, fusion string) ([]types.SearchResult, bool, error) {
+func (c *Client) searchScore(ctx context.Context, query string, topK int, retriever string, noSnippet bool) ([]types.SearchResult, bool, error) {
 	nodes := c.ring.Nodes()
 	fetchK := topK * len(nodes)
 	results := make(chan searchNodeResult, len(nodes))
@@ -219,7 +328,7 @@ func (c *Client) searchScore(ctx context.Context, query string, topK int, retrie
 	for _, n := range nodes {
 		n := n
 		go func() {
-			docs, degraded, err := c.searchNode(ctx, n, query, fetchK, retriever, fusion)
+			docs, degraded, err := c.searchNode(ctx, n, query, fetchK, retriever, noSnippet)
 			results <- searchNodeResult{nodeID: n.NodeID, docs: docs, degraded: degraded, err: err}
 		}()
 	}
@@ -259,7 +368,7 @@ func (c *Client) searchNode(
 	query string,
 	topK int,
 	retriever string,
-	fusion string,
+	noSnippet bool,
 ) ([]types.SearchResult, bool /*degraded*/, error) {
 	cb := c.breaker(node.NodeID)
 	allowed, done := cb.Allow()
@@ -272,8 +381,8 @@ func (c *Client) searchNode(
 		"top_k":     {strconv.Itoa(topK)},
 		"retriever": {retriever},
 	}
-	if fusion != "" {
-		params.Set("fusion", fusion)
+	if noSnippet {
+		params.Set("no_snippet", "1")
 	}
 
 	var resp shardSearchResponse
@@ -283,17 +392,6 @@ func (c *Client) searchNode(
 		return nil, false, err
 	}
 	return resp.Results, false, nil
-}
-
-func (c *Client) postJSONDecode(ctx context.Context, node *NodeMeta, path string, body []byte, dst interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://"+node.HTTPAddr+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	return c.doDecodeWithBreaker(node, req, dst)
 }
 
 func (c *Client) getJSON(ctx context.Context, node *NodeMeta, pathAndQuery string, dst interface{}) error {
@@ -322,27 +420,6 @@ func (c *Client) doWithDone(req *http.Request, done func(bool)) error {
 	done(ok)
 	if !ok {
 		return fmt.Errorf("client: node returned %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func (c *Client) doWithBreaker(node *NodeMeta, req *http.Request) error {
-	cb := c.breaker(node.NodeID)
-	allowed, done := cb.Allow()
-	if !allowed {
-		return fmt.Errorf("client: circuit breaker open for %s", node.NodeID)
-	}
-	resp, err := c.httpCli.Do(req)
-	if err != nil {
-		done(false)
-		return err
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	ok := resp.StatusCode < 500
-	done(ok)
-	if !ok {
-		return fmt.Errorf("client: node %s returned %d", node.NodeID, resp.StatusCode)
 	}
 	return nil
 }
@@ -413,6 +490,7 @@ func mergeResultsByScore(lists [][]types.SearchResult, topK int) []types.SearchR
 		out[i] = types.SearchResult{
 			DocID:    e.docID,
 			Score:    e.score,
+			Rank:     i + 1,
 			Snippet:  snippets[e.docID],
 			Metadata: metas[e.docID],
 		}

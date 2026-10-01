@@ -11,7 +11,7 @@ func TestApplyEnvOverridesDefault(t *testing.T) {
 	keys := []string{
 		"SEARCH_SERVER_MODE", "SEARCH_SERVER_PORT", "SEARCH_LOG_LEVEL",
 		"SEARCH_SEARCH_GLOBAL_FUSION", "SEARCH_CLUSTER_GRPC_ADDR",
-		"SEARCH_STORAGE_DATA_DIR",
+		"SEARCH_STORAGE_DATA_DIR", "SEARCH_CLUSTER_REPLICATION_ROLE", "SEARCH_CLUSTER_PRIMARY_ADDR",
 	}
 	t.Cleanup(func() {
 		for _, k := range keys {
@@ -25,6 +25,8 @@ func TestApplyEnvOverridesDefault(t *testing.T) {
 	os.Setenv("SEARCH_SEARCH_GLOBAL_FUSION", "rrf")
 	os.Setenv("SEARCH_CLUSTER_GRPC_ADDR", "node-1:9090")
 	os.Setenv("SEARCH_STORAGE_DATA_DIR", "/mnt/efs/data")
+	os.Setenv("SEARCH_CLUSTER_REPLICATION_ROLE", "replica")
+	os.Setenv("SEARCH_CLUSTER_PRIMARY_ADDR", "node-0:9090")
 
 	cfg := config.Default()
 	config.ApplyEnv(cfg)
@@ -47,6 +49,12 @@ func TestApplyEnvOverridesDefault(t *testing.T) {
 	if cfg.Storage.DataDir != "/mnt/efs/data" {
 		t.Errorf("Storage.DataDir: want /mnt/efs/data, got %s", cfg.Storage.DataDir)
 	}
+	if cfg.Cluster.ReplicationRole != "replica" {
+		t.Errorf("Cluster.ReplicationRole: want replica, got %s", cfg.Cluster.ReplicationRole)
+	}
+	if cfg.Cluster.PrimaryAddr != "node-0:9090" {
+		t.Errorf("Cluster.PrimaryAddr: want node-0:9090, got %s", cfg.Cluster.PrimaryAddr)
+	}
 }
 
 func TestApplyEnvNoopWhenEnvUnset(t *testing.T) {
@@ -63,5 +71,17 @@ func TestApplyEnvNoopWhenEnvUnset(t *testing.T) {
 	}
 	if cfg1.Search.GlobalFusion != cfg2.Search.GlobalFusion {
 		t.Errorf("GlobalFusion changed: %s → %s", cfg1.Search.GlobalFusion, cfg2.Search.GlobalFusion)
+	}
+}
+
+func TestRefreshIntervalDefaultAndEnv(t *testing.T) {
+	if got := config.Default().Index.RefreshIntervalMs; got != 1000 {
+		t.Errorf("default Index.RefreshIntervalMs: want 1000, got %d", got)
+	}
+	t.Setenv("SEARCH_INDEX_REFRESH_INTERVAL_MS", "-1")
+	cfg := config.Default()
+	config.ApplyEnv(cfg)
+	if cfg.Index.RefreshIntervalMs != -1 {
+		t.Errorf("SEARCH_INDEX_REFRESH_INTERVAL_MS: want -1, got %d", cfg.Index.RefreshIntervalMs)
 	}
 }

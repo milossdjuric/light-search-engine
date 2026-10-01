@@ -25,7 +25,7 @@ func TestHealthPollerTripsCircuitBreaker(t *testing.T) {
 
 	nodes := []*cluster.NodeMeta{
 		{NodeID: "healthy-node", HTTPAddr: healthy.Listener.Addr().String()},
-		{NodeID: "dead-node",    HTTPAddr: dead.Listener.Addr().String()},
+		{NodeID: "dead-node", HTTPAddr: dead.Listener.Addr().String()},
 	}
 
 	breakers := map[string]*cluster.CircuitBreaker{
@@ -47,11 +47,11 @@ func TestHealthPollerTripsCircuitBreaker(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// healthy-node breaker must be closed (not open).
-	if breakers["healthy-node"].IsOpen() {
+	if breakers["healthy-node"].State() == "open" {
 		t.Error("healthy-node circuit breaker is open; want closed")
 	}
 	// dead-node breaker must be open after 3+ failures.
-	if !breakers["dead-node"].IsOpen() {
+	if breakers["dead-node"].State() != "open" {
 		t.Error("dead-node circuit breaker is not open after repeated 503s; want open")
 	}
 }

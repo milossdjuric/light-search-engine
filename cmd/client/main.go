@@ -22,6 +22,7 @@
 //	-top-k     N                 Results to return for search (default: 10)
 //	-retriever bm25|tfidf        Retriever to use for search (default: bm25)
 //	-pretty                      Pretty-print JSON output
+//	-api-key   KEY               Bearer token for write commands (default: $SEARCH_SERVER_API_KEY)
 package main
 
 import (
@@ -45,6 +46,7 @@ var (
 	topK      = flag.Int("top-k", 10, "number of results to return")
 	retriever = flag.String("retriever", "bm25", "retriever type: bm25|tfidf")
 	pretty    = flag.Bool("pretty", false, "pretty-print JSON output")
+	apiKey    = flag.String("api-key", os.Getenv("SEARCH_SERVER_API_KEY"), "API key sent as a Bearer token (default: $SEARCH_SERVER_API_KEY)")
 )
 
 func main() {
@@ -59,7 +61,7 @@ func main() {
 	cmd := flag.Arg(0)
 	args := flag.Args()[1:]
 
-	cli := &client{base: strings.TrimRight(*serverURL, "/")}
+	cli := &client{base: strings.TrimRight(*serverURL, "/"), apiKey: *apiKey}
 
 	var err error
 	switch cmd {
@@ -128,26 +130,28 @@ EXAMPLES
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
 type client struct {
-	base string
-	http http.Client
+	base   string
+	apiKey string // sent as "Authorization: Bearer <key>" when non-empty
 }
 
 func init() {
 	http.DefaultClient.Timeout = 30 * time.Second
 }
 
-func (c *client) get(path string) ([]byte, int, error) {
-	resp, err := http.Get(c.base + path)
+// do sends a request to the server, attaching the API key when configured,
+// and returns the response body and status code.
+func (c *client) do(method, path string, body io.Reader, contentType string) ([]byte, int, error) {
+	req, err := http.NewRequest(method, c.base+path, body)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, err
-}
-
-func (c *client) post(path string, body []byte, contentType string) ([]byte, int, error) {
-	resp, err := http.Post(c.base+path, contentType, bytes.NewReader(body))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -156,18 +160,16 @@ func (c *client) post(path string, body []byte, contentType string) ([]byte, int
 	return b, resp.StatusCode, err
 }
 
+func (c *client) get(path string) ([]byte, int, error) {
+	return c.do(http.MethodGet, path, nil, "")
+}
+
+func (c *client) post(path string, body []byte, contentType string) ([]byte, int, error) {
+	return c.do(http.MethodPost, path, bytes.NewReader(body), contentType)
+}
+
 func (c *client) delete(path string) ([]byte, int, error) {
-	req, err := http.NewRequest(http.MethodDelete, c.base+path, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, err
+	return c.do(http.MethodDelete, path, nil, "")
 }
 
 // printJSON outputs raw JSON, optionally pretty-printed.
@@ -314,13 +316,11 @@ func (c *client) cmdBulk(args []string) error {
 		pw.Close()
 	}()
 
-	resp, err := http.Post(c.base+"/index/bulk", "application/x-ndjson", pr)
+	body, status, err := c.do(http.MethodPost, "/index/bulk", pr, "application/x-ndjson")
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if err := checkStatus(body, resp.StatusCode, "bulk"); err != nil {
+	if err := checkStatus(body, status, "bulk"); err != nil {
 		return err
 	}
 	printJSON(body)

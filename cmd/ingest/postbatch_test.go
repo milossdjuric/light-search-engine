@@ -19,12 +19,39 @@ func TestPostBatchTreatsErrorStatusAsFullBatchFailure(t *testing.T) {
 	defer srv.Close()
 
 	batch := []Record{{ID: "d1", Text: "hello"}, {ID: "d2", Text: "world"}}
-	indexed, failed, _ := postBatch(srv.Client(), srv.URL, batch)
+	indexed, failed, _ := postBatch(srv.Client(), srv.URL, "", batch)
 
 	if indexed != 0 {
 		t.Errorf("indexed = %d, want 0 (server returned an error, nothing was actually indexed)", indexed)
 	}
 	if failed != len(batch) {
 		t.Errorf("failed = %d, want %d (an error response must count the whole batch as failed, not (0,0))", failed, len(batch))
+	}
+}
+
+// TestIngestSendsAPIKey verifies postBatch and the post-ingest flush/GC calls
+// present the server API key; without it every batch 401s against a server
+// with server.api_key set.
+func TestIngestSendsAPIKey(t *testing.T) {
+	got := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got[r.URL.Path] = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"indexed":1,"failed":0}`))
+	}))
+	defer srv.Close()
+
+	postBatch(srv.Client(), srv.URL, "secret", []Record{{ID: "d1", Text: "hello"}})
+	if err := postServer(srv.Client(), srv.URL, "/index/flush", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := postServer(srv.Client(), srv.URL, "/admin/gc", "secret"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range []string{"/index/bulk", "/index/flush", "/admin/gc"} {
+		if got[p] != "Bearer secret" {
+			t.Errorf("%s: Authorization = %q, want %q", p, got[p], "Bearer secret")
+		}
 	}
 }

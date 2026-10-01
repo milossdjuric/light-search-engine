@@ -17,13 +17,13 @@ type SearchResponse struct {
 
 // SegmentInfo is one element of the GET /segments response.
 type SegmentInfo struct {
-	ShardID    string `json:"shard_id"`
-	SegmentID  string `json:"segment_id"`
-	Level      int    `json:"level"`
-	DocCount   int    `json:"doc_count"`
-	SizeBytes  int64  `json:"size_bytes"`
-	Path       string `json:"path"`
-	FlushSeq   int64  `json:"flush_seq"`
+	ShardID   string `json:"shard_id"`
+	SegmentID string `json:"segment_id"`
+	Level     int    `json:"level"`
+	DocCount  int    `json:"doc_count"`
+	SizeBytes int64  `json:"size_bytes"`
+	Path      string `json:"path"`
+	FlushSeq  int64  `json:"flush_seq"`
 }
 
 // ShardInfo is one element of the GET /shards response.
@@ -47,6 +47,7 @@ type HealthResponse struct {
 	Ready       bool   `json:"ready"`
 	Warm        bool   `json:"warm"`
 	LocalShards []int  `json:"local_shards,omitempty"` // present on shard nodes; used by K8s membership watcher
+	Replication any    `json:"replication,omitempty"`  // replication role and per-shard progress, when enabled
 }
 
 // ErrorResponse is the JSON body for error responses.

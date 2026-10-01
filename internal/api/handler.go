@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"github.com/bytedance/sonic"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,30 +12,59 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bytedance/sonic"
+
 	"search-eval-platform/internal/cluster"
-	"search-eval-platform/internal/retrieval/bm25"
-	"search-eval-platform/internal/retrieval/bm25f"
-	"search-eval-platform/internal/retrieval/index"
-	"search-eval-platform/internal/retrieval/tfidf"
-	"search-eval-platform/internal/search"
+	"search-eval-platform/internal/scoring"
+	"search-eval-platform/internal/shard"
 	"search-eval-platform/pkg/types"
 )
 
 // Handler holds the dependencies injected into all HTTP handlers.
 type Handler struct {
-	shards      *search.ShardManager // non-nil in standalone/shard modes
-	client      *cluster.Client      // non-nil in coordinator mode
+	shards      *shard.ShardManager // non-nil in standalone/shard modes
+	client      *cluster.Client     // non-nil in coordinator mode
 	mode        string
 	bm25K1      float64
 	bm25B       float64
 	apiKey      string // if non-empty, write endpoints require Authorization: Bearer <key>
 	localShards []int  // local shard IDs for this node; reported in /health for K8s discovery
+	defaultTopK int    // top_k when a search request has none (search.default_top_k); <=0 means 10
 	ready       atomic.Bool
 	warm        atomic.Bool
+
+	readOnly   string     // non-empty on a replication replica: client writes are rejected with this reason
+	requireWAL bool       // replication primary: ?wal=off is ignored so every write reaches replicas
+	replStatus func() any // replication state reported in /health; nil when replication is off
+}
+
+// SetReadOnly makes write endpoints return 503 with reason (replication
+// replicas: all writes must come from the primary). Call before Register.
+func (h *Handler) SetReadOnly(reason string) { h.readOnly = reason }
+
+// SetRequireWAL forces every write through the WAL, ignoring ?wal=off
+// (replication primaries: unlogged writes would never reach replicas).
+func (h *Handler) SetRequireWAL(v bool) { h.requireWAL = v }
+
+// SetReplicationStatus sets the provider of the "replication" field in /health.
+func (h *Handler) SetReplicationStatus(fn func() any) { h.replStatus = fn }
+
+// writable rejects the request on a read-only replica.
+func (h *Handler) writable(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.readOnly != "" {
+			WriteError(w, http.StatusServiceUnavailable, h.readOnly+": send writes to the primary")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // SetReady marks the handler as ready to serve search requests.
 func (h *Handler) SetReady() { h.ready.Store(true) }
+
+// SetDefaultTopK sets the result count used when a search request has no top_k.
+func (h *Handler) SetDefaultTopK(n int) { h.defaultTopK = n }
 
 // SetLocalShards records the shard IDs owned by this node, reported via /health.
 func (h *Handler) SetLocalShards(shards []int) { h.localShards = shards }
@@ -49,7 +77,7 @@ func (h *Handler) SetWarm() { h.warm.Store(true) }
 func (h *Handler) ResetWarm() { h.warm.Store(false) }
 
 // NewHandler creates a Handler wired to the given ShardManager (standalone/shard mode).
-func NewHandler(shards *search.ShardManager, mode string, k1, b float64, apiKey string) *Handler {
+func NewHandler(shards *shard.ShardManager, mode string, k1, b float64, apiKey string) *Handler {
 	return &Handler{shards: shards, mode: mode, bm25K1: k1, bm25B: b, apiKey: apiKey}
 }
 
@@ -77,16 +105,16 @@ func (h *Handler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // Register mounts all routes onto mux using Go 1.22 method+path patterns.
 func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /index", h.requireAuth(h.handleIndex))
-	mux.HandleFunc("DELETE /index/{id}", h.requireAuth(h.handleDelete))
-	mux.HandleFunc("POST /index/bulk", h.requireAuth(h.handleBulk))
+	mux.HandleFunc("POST /index", h.requireAuth(h.writable(h.handleIndex)))
+	mux.HandleFunc("DELETE /index/{id}", h.requireAuth(h.writable(h.handleDelete)))
+	mux.HandleFunc("POST /index/bulk", h.requireAuth(h.writable(h.handleBulk)))
 	mux.HandleFunc("POST /index/flush", h.requireAuth(h.handleFlush))
 	mux.HandleFunc("POST /index/merge", h.requireAuth(h.handleMerge))
 	mux.HandleFunc("GET /search", h.handleSearch)
 	mux.HandleFunc("GET /health", h.handleHealth)
 	mux.HandleFunc("GET /segments", h.handleSegments)
 	mux.HandleFunc("GET /shards", h.handleShards)
-	mux.HandleFunc("POST /admin/reset", h.requireAuth(h.handleReset))
+	mux.HandleFunc("POST /admin/reset", h.requireAuth(h.writable(h.handleReset)))
 	mux.HandleFunc("POST /admin/gc", h.requireAuth(h.handleGC))
 }
 
@@ -94,7 +122,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 // These endpoints are used by coordinator nodes and are not part of the
 // public API.
 func (h *Handler) RegisterInternal(mux *http.ServeMux) {
-	mux.HandleFunc("POST /internal/index", h.handleInternalIndex)
+	mux.HandleFunc("POST /internal/index", h.writable(h.handleInternalIndex))
 	mux.HandleFunc("POST /internal/search", h.handleInternalSearch)
 }
 
@@ -194,7 +222,7 @@ func (h *Handler) handleBulk(w http.ResponseWriter, r *http.Request) {
 	var batch []types.Document
 
 	scanner := bufio.NewScanner(io.LimitReader(r.Body, 256<<20)) // 256 MB
-	scanner.Buffer(make([]byte, 1<<20), 1<<20)                    // 1 MB per line
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)                   // 1 MB per line
 
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
@@ -221,19 +249,13 @@ func (h *Handler) handleBulk(w http.ResponseWriter, r *http.Request) {
 	indexed := 0
 	if len(batch) > 0 {
 		if h.client != nil {
-			// Coordinator: no batch API — fan out docs one at a time.
-			for _, doc := range batch {
-				if e := h.client.IndexDoc(r.Context(), doc); e != nil {
-					slog.Error("handleBulk coordinator IndexDoc", "doc_id", doc.ID, "err", e)
-					failed++
-				} else {
-					indexed++
-				}
-			}
+			// Coordinator: one bulk request per shard node.
+			n, f := h.client.IndexBatch(r.Context(), batch)
+			indexed, failed = n, failed+f
 		} else {
 			walMode := r.URL.Query().Get("wal") // "off" skips WAL; "" or "sync"/"async" use WAL
 			var indexErr error
-			if walMode == "off" {
+			if walMode == "off" && !h.requireWAL {
 				indexErr = h.shards.IndexBatchNoWAL(r.Context(), batch)
 			} else {
 				indexErr = h.shards.IndexBatch(r.Context(), batch)
@@ -301,7 +323,7 @@ func (h *Handler) handleMerge(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /search
-// Query params: q, top_k (default 10), retriever (bm25|tfidf, default bm25)
+// Query params: q, top_k (default search.default_top_k, 10), retriever (bm25|tfidf, default bm25)
 
 func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if !h.ready.Load() {
@@ -315,7 +337,10 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	topK := 10
+	topK := h.defaultTopK
+	if topK <= 0 {
+		topK = 10
+	}
 	if v := r.URL.Query().Get("top_k"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			topK = n
@@ -336,7 +361,7 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	if h.client != nil {
 		// Coordinator mode: fan out to shard nodes.
-		results, degraded, err = h.client.Search(r.Context(), q, topK, retrieverLabel, "")
+		results, degraded, err = h.client.Search(r.Context(), q, topK, retrieverLabel, noSnippet)
 	} else {
 		scorer := h.scorerForRetriever(retrieverLabel)
 		var shardDegraded bool
@@ -363,16 +388,16 @@ func (h *Handler) handleSearch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// scorerForRetriever returns the index.Scorer for the given retriever name.
+// scorerForRetriever returns the scoring.Scorer for the given retriever name.
 // Defaults to BM25 with configured parameters.
-func (h *Handler) scorerForRetriever(name string) index.Scorer {
+func (h *Handler) scorerForRetriever(name string) scoring.Scorer {
 	switch name {
 	case "tfidf":
-		return tfidf.NewScorerOnly()
+		return scoring.NewTFIDF()
 	case "bm25f":
-		return bm25f.NewScorerOnly(h.bm25K1)
+		return scoring.NewBM25F(h.bm25K1)
 	default: // "bm25" or ""
-		return bm25.NewScorerOnly(h.bm25K1, h.bm25B)
+		return scoring.NewBM25(h.bm25K1, h.bm25B)
 	}
 }
 
@@ -388,14 +413,18 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if !ready {
 		status = http.StatusServiceUnavailable
 	}
-	WriteJSON(w, status, HealthResponse{
+	resp := HealthResponse{
 		Status:      "ok",
 		Mode:        h.mode,
 		Shards:      shardCount,
 		Ready:       ready,
 		Warm:        h.warm.Load(),
 		LocalShards: h.localShards,
-	})
+	}
+	if h.replStatus != nil {
+		resp.Replication = h.replStatus()
+	}
+	WriteJSON(w, status, resp)
 }
 
 // GET /segments
@@ -568,4 +597,3 @@ func (h *Handler) handleInternalSearch(w http.ResponseWriter, r *http.Request) {
 		TookMs:  elapsed.Milliseconds(),
 	})
 }
-

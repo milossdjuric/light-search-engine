@@ -1,25 +1,24 @@
-.PHONY: build clean server test race integration test-all bench native
+.PHONY: build clean server test race integration test-all bench
 
 BIN := bin
 
-# Rust delta-varbyte decoder linked by internal/retrieval/index/deltavarbyte_cgo.go
-# (amd64+cgo). The target triple must match that file's #cgo LDFLAGS path.
-native:
-	cargo build --release --manifest-path native/deltavarbyte/Cargo.toml --target x86_64-unknown-linux-gnu
+# The native kernels (AVX2 C on amd64, NEON C++ on arm64) live in
+# internal/codec and are compiled by cgo as part of `go build`; they need a C
+# compiler (plus a C++ one on arm64) and CGO_ENABLED=1, but no separate step.
 
-build: native
+build:
 	mkdir -p $(BIN)
 	CGO_ENABLED=1 go build -o $(BIN)/search-server  ./cmd/server/
 	CGO_ENABLED=1 go build -o $(BIN)/search-client  ./cmd/client/
 	CGO_ENABLED=1 go build -o $(BIN)/search-ingest  ./cmd/ingest/
 
-server: native
+server:
 	CGO_ENABLED=1 go run ./cmd/server/
 
-test: native
+test:
 	go test ./... -v
 
-race: native
+race:
 	go test -race ./...
 
 integration:
@@ -28,8 +27,8 @@ integration:
 # Full local verification: build, unit tests, race detector, integration tests.
 test-all: build test race integration
 
-bench: native
+bench:
 	go test ./... -bench=. -benchmem
 
 clean:
-	rm -rf $(BIN) search-server native/deltavarbyte/target
+	rm -rf $(BIN) search-server

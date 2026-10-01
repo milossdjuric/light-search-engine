@@ -12,12 +12,12 @@ import (
 // Config is the top-level configuration structure.
 // All fields have sensible defaults (see Default()).
 type Config struct {
-	Server      ServerConfig      `yaml:"server"`
-	Storage     StorageConfig     `yaml:"storage"`
-	Index       IndexConfig       `yaml:"index"`
-	Search      SearchConfig      `yaml:"search"`
-	Logging     LoggingConfig     `yaml:"logging"`
-	Cluster     ClusterConfig     `yaml:"cluster"`
+	Server  ServerConfig  `yaml:"server"`
+	Storage StorageConfig `yaml:"storage"`
+	Index   IndexConfig   `yaml:"index"`
+	Search  SearchConfig  `yaml:"search"`
+	Logging LoggingConfig `yaml:"logging"`
+	Cluster ClusterConfig `yaml:"cluster"`
 }
 
 // ServerConfig controls the HTTP listener.
@@ -31,11 +31,9 @@ type ServerConfig struct {
 	APIKey string `yaml:"api_key"`
 }
 
-// StorageConfig selects the storage paths for manifests and data files.
+// StorageConfig selects where data lives on disk.
 type StorageConfig struct {
-	// Path is the file path for the segment manifest (e.g. data/manifest.json)
-	Path string `yaml:"path"`
-	// DataDir is the root for WAL and segment files
+	// DataDir is the root for WAL files, per-shard manifests and segment files.
 	DataDir string `yaml:"data_dir"`
 }
 
@@ -47,8 +45,7 @@ type StemmingConfig struct {
 
 // StopwordsConfig controls the stopword-filtering pipeline stage.
 type StopwordsConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Language string `yaml:"language"` // "en" = English (bbalet/stopwords language code)
+	Enabled bool `yaml:"enabled"` // English stopword list
 }
 
 // FieldConfig defines BM25F scoring parameters for one document field.
@@ -61,41 +58,40 @@ type FieldConfig struct {
 
 // IndexConfig tunes the indexing pipeline.
 type IndexConfig struct {
-	MemThresholdMB     int            `yaml:"mem_threshold_mb"`
-	MaxBufferDocs      int            `yaml:"max_buffer_docs"`
-	NumShards          int            `yaml:"num_shards"`
-	BM25K1             float64        `yaml:"bm25_k1"`
-	BM25B              float64        `yaml:"bm25_b"`
-	SegmentsPerTier    int            `yaml:"segments_per_tier"`
-	MaxMergeAtOnce     int            `yaml:"max_merge_at_once"`
-	SegmentCompression string         `yaml:"segment_compression"` // "" | "lz4"
-	UseFOR32           bool           `yaml:"use_for32"`           // true → v6 FOR-delta segments (AVX2 SIMD); default true
-	BloomFPRate        float64        `yaml:"bloom_fp_rate"`       // 0 = disabled
-	Stemming           StemmingConfig  `yaml:"stemming"`
-	Stopwords          StopwordsConfig `yaml:"stopwords"`
-	Scorer             string          `yaml:"scorer"`  // "bm25" (default) | "tfidf" | "bm25f"
-	Fields             []FieldConfig  `yaml:"fields"`  // BM25F field definitions (scorer=bm25f only)
-	WALDurability      string         `yaml:"wal_durability"`       // "async" (default) | "sync" | "off"
-	WALSyncIntervalMs  int            `yaml:"wal_sync_interval_ms"` // default 1000 (ms between async flushes)
-	WALCompression     string         `yaml:"wal_compression"`      // "" | "lz4"
-	IdleFlushSecs      int            `yaml:"idle_flush_secs"`      // flush buffer if no writes for N seconds; 0 = disabled
-	MaxMergeSizeMB          int64          `yaml:"max_merge_size_mb"`           // cap total input size per merge; 0 = disabled
-	MergeRateLimitMBps      float64        `yaml:"merge_rate_limit_mbps"`        // MB/s token-bucket limit on merge I/O; 0 = unlimited
-	MergeIOBurstMB          int            `yaml:"merge_io_burst_mb"`            // token-bucket burst in MB; 0 = auto (rate×0.5s)
-	MergeDeletionWeight     float64        `yaml:"merge_deletion_weight"`        // α in deletion_score=1+α*(deleted/total); 0 = disable deletion-aware scoring; default 2.0
-	FloorSegmentMB          int64          `yaml:"floor_segment_mb"`             // treat segments smaller than this as this size in tier math; default 2 MB
-	ExpungeDeletesPct       float64        `yaml:"expunge_deletes_pct"`          // opportunistically merge segments with deletion ratio >= this; 0 = disabled; default 0.25
-	BufferPoolSize     int            `yaml:"buffer_pool_size"`      // number of background-flush swap buffers per shard; 0 = default (4)
-	SkipStoredFields   bool           `yaml:"skip_stored_fields"`    // omit .seg.fld sidecars; disables snippet generation but cuts segment size ~75%
-	MergeOnStartup      bool           `yaml:"merge_on_startup"`       // compact segments at startup before serving; default true
-	WarmupOnStartup        bool           `yaml:"warmup_on_startup"`           // load all segments into RAM at startup; default true
-	StartupMergeTarget     int            `yaml:"startup_merge_target"`        // target segment count after startup merge; default 3 (0 or 1 = merge to 1)
-	WarmupTopTerms         int            `yaml:"warmup_top_terms"`            // top-K DF terms to warm; default 1000; 0 = disabled
-	MLockSegments          bool           `yaml:"mlock_segments"`              // attempt mlock after warmup; requires CAP_IPC_LOCK
-	WarmupMode             string         `yaml:"warmup_mode"`                 // "top_k" (default) | "full" | "tiered"
-	WarmupTierThresholdMB  int            `yaml:"warmup_tier_threshold_mb"`    // tiered mode: segments <= this get full warmup; default 256
-	VirtualNodesPerShard   int            `yaml:"virtual_nodes_per_shard"`     // virtual nodes per shard for consistent-hash ring routing; 0 = default (150)
-	SynonymFile            string         `yaml:"synonym_file"`                // path to synonyms.txt; "" = disabled
+	MemThresholdMB        int             `yaml:"mem_threshold_mb"`
+	MaxBufferDocs         int             `yaml:"max_buffer_docs"`
+	NumShards             int             `yaml:"num_shards"`
+	BM25K1                float64         `yaml:"bm25_k1"`
+	BM25B                 float64         `yaml:"bm25_b"`
+	SegmentsPerTier       int             `yaml:"segments_per_tier"`
+	MaxMergeAtOnce        int             `yaml:"max_merge_at_once"`
+	BloomFPRate           float64         `yaml:"bloom_fp_rate"` // 0 = disabled
+	Stemming              StemmingConfig  `yaml:"stemming"`
+	Stopwords             StopwordsConfig `yaml:"stopwords"`
+	Scorer                string          `yaml:"scorer"`                   // "bm25" (default) | "tfidf" | "bm25f"
+	Fields                []FieldConfig   `yaml:"fields"`                   // BM25F field definitions (scorer=bm25f only)
+	WALDurability         string          `yaml:"wal_durability"`           // "async" (default) | "sync" | "off"
+	WALSyncIntervalMs     int             `yaml:"wal_sync_interval_ms"`     // default 1000 (ms between async flushes)
+	WALCompression        string          `yaml:"wal_compression"`          // "" | "lz4"
+	IdleFlushSecs         int             `yaml:"idle_flush_secs"`          // flush buffer if no writes for N seconds; 0 = disabled
+	RefreshIntervalMs     int             `yaml:"refresh_interval_ms"`      // new writes searchable within this many ms; 0 = next search, -1 = only after flush
+	MaxMergeSizeMB        int64           `yaml:"max_merge_size_mb"`        // cap total input size per merge; 0 = disabled
+	MergeRateLimitMBps    float64         `yaml:"merge_rate_limit_mbps"`    // MB/s token-bucket limit on merge I/O; 0 = unlimited
+	MergeIOBurstMB        int             `yaml:"merge_io_burst_mb"`        // token-bucket burst in MB; 0 = auto (rate×0.5s)
+	MergeDeletionWeight   float64         `yaml:"merge_deletion_weight"`    // α in deletion_score=1+α*(deleted/total); 0 = disable deletion-aware scoring; default 2.0
+	FloorSegmentMB        int64           `yaml:"floor_segment_mb"`         // treat segments smaller than this as this size in tier math; default 2 MB
+	ExpungeDeletesPct     float64         `yaml:"expunge_deletes_pct"`      // opportunistically merge segments with deletion ratio >= this; 0 = disabled; default 0.25
+	BufferPoolSize        int             `yaml:"buffer_pool_size"`         // number of background-flush swap buffers per shard; 0 = default (4)
+	SkipStoredFields      bool            `yaml:"skip_stored_fields"`       // omit .seg.fld sidecars; disables snippet generation but cuts segment size ~75%
+	MergeOnStartup        bool            `yaml:"merge_on_startup"`         // compact segments at startup before serving; default true
+	WarmupOnStartup       bool            `yaml:"warmup_on_startup"`        // load all segments into RAM at startup; default true
+	StartupMergeTarget    int             `yaml:"startup_merge_target"`     // target segment count after startup merge; default 3 (0 or 1 = merge to 1)
+	WarmupTopTerms        int             `yaml:"warmup_top_terms"`         // top-K DF terms to warm; default 1000; 0 = disabled
+	MLockSegments         bool            `yaml:"mlock_segments"`           // attempt mlock after warmup; requires CAP_IPC_LOCK
+	WarmupMode            string          `yaml:"warmup_mode"`              // "top_k" (default) | "full" | "tiered"
+	WarmupTierThresholdMB int             `yaml:"warmup_tier_threshold_mb"` // tiered mode: segments <= this get full warmup; default 256
+	VirtualNodesPerShard  int             `yaml:"virtual_nodes_per_shard"`  // virtual nodes per shard for consistent-hash ring routing; 0 = default (150)
+	SynonymFile           string          `yaml:"synonym_file"`             // path to synonyms.txt; "" = disabled
 }
 
 // SearchConfig tunes query execution.
@@ -107,6 +103,10 @@ type SearchConfig struct {
 	DefaultTopK    int    `yaml:"default_top_k"`
 	QueryCacheSize int    `yaml:"query_cache_size"` // 0 = disabled
 	DocCacheSize   int    `yaml:"doc_cache_size"`   // LRU doc text cache entries, default 50000
+	// PhraseBoost multiplies a result's score by (1 + PhraseBoost) for each
+	// "quoted phrase" it contains. 0 = default (search.DefaultPhraseBoost);
+	// negative = phrases are scored as plain terms only.
+	PhraseBoost float64 `yaml:"phrase_boost"`
 }
 
 // LoggingConfig controls log output.
@@ -119,11 +119,16 @@ type LoggingConfig struct {
 
 // ClusterConfig is used only in coordinator/shard modes.
 type ClusterConfig struct {
-	NodeID         string   `yaml:"node_id"`
 	LocalShards    []int    `yaml:"local_shards"`
 	TotalShards    int      `yaml:"total_shards"`
 	BootstrapAddrs []string `yaml:"bootstrap_addrs"`
 	GRPCAddr       string   `yaml:"grpc_addr"`
+
+	// WAL replication (shard mode). "primary" serves every local shard's WAL
+	// over gRPC on GRPCAddr's port; "replica" follows PrimaryAddr and rejects
+	// client writes; "" disables replication.
+	ReplicationRole string `yaml:"replication_role"`
+	PrimaryAddr     string `yaml:"primary_addr"` // replica only: the primary's gRPC host:port
 
 	// K8s-native membership discovery (coordinator only).
 	// When K8sService is set, the coordinator watches the named Endpoints
@@ -143,27 +148,26 @@ func Default() *Config {
 			Mode: "shard",
 		},
 		Storage: StorageConfig{
-			Path:    "data/manifest.json",
 			DataDir: "data",
 		},
 		Index: IndexConfig{
-			UseFOR32:           true,
-			MemThresholdMB:     512,
-			MaxBufferDocs:      100_000,
-			WALDurability:      "async",
-			WALSyncIntervalMs:  1000,
-			NumShards:          1,
-			BM25K1:             1.2,
-			BM25B:              0.75,
-			SegmentsPerTier:    15,
-			MaxMergeAtOnce:     10,
-			MaxMergeSizeMB:          256,
-			MergeRateLimitMBps:      80,
-			MergeDeletionWeight:     2.0,
-			FloorSegmentMB:          2,
-			ExpungeDeletesPct:       0.25,
-			BufferPoolSize:     4,
-			MergeOnStartup:     true,
+			MemThresholdMB:        512,
+			MaxBufferDocs:         100_000,
+			WALDurability:         "async",
+			WALSyncIntervalMs:     1000,
+			RefreshIntervalMs:     1000,
+			NumShards:             1,
+			BM25K1:                1.2,
+			BM25B:                 0.75,
+			SegmentsPerTier:       15,
+			MaxMergeAtOnce:        10,
+			MaxMergeSizeMB:        256,
+			MergeRateLimitMBps:    80,
+			MergeDeletionWeight:   2.0,
+			FloorSegmentMB:        2,
+			ExpungeDeletesPct:     0.25,
+			BufferPoolSize:        4,
+			MergeOnStartup:        true,
 			WarmupOnStartup:       true,
 			StartupMergeTarget:    2,
 			WarmupTopTerms:        1000,
@@ -171,15 +175,13 @@ func Default() *Config {
 			WarmupMode:            "tiered",
 			WarmupTierThresholdMB: 600,
 			VirtualNodesPerShard:  150,
-			SegmentCompression: "",
-			BloomFPRate:        0.01,
+			BloomFPRate:           0.01,
 			Stemming: StemmingConfig{
 				Enabled:  false,
 				Language: "english",
 			},
 			Stopwords: StopwordsConfig{
-				Enabled:  false,
-				Language: "en",
+				Enabled: false,
 			},
 			Scorer: "bm25",
 		},
@@ -228,21 +230,22 @@ func Load(path string) (*Config, error) {
 //	SEARCH_INDEX_MEM_THRESHOLD_MB    index.mem_threshold_mb
 //	SEARCH_INDEX_BM25_K1             index.bm25_k1
 //	SEARCH_INDEX_BM25_B              index.bm25_b
-//	SEARCH_INDEX_SEGMENT_COMPRESSION index.segment_compression
 //	SEARCH_INDEX_BLOOM_FP_RATE       index.bloom_fp_rate
 //	SEARCH_INDEX_WARMUP_MODE               index.warmup_mode
 //	SEARCH_INDEX_VIRTUAL_NODES_PER_SHARD   index.virtual_nodes_per_shard
+//	SEARCH_INDEX_REFRESH_INTERVAL_MS       index.refresh_interval_ms
 //	SEARCH_SEARCH_GLOBAL_FUSION            search.global_fusion
-//	SEARCH_CLUSTER_NODE_ID           cluster.node_id
+//	SEARCH_SEARCH_PHRASE_BOOST             search.phrase_boost
 //	SEARCH_CLUSTER_TOTAL_SHARDS      cluster.total_shards
 //	SEARCH_CLUSTER_LOCAL_SHARDS      cluster.local_shards  (comma-separated ints)
 //	SEARCH_CLUSTER_BOOTSTRAP         cluster.bootstrap_addrs (comma-separated)
 //	SEARCH_CLUSTER_GRPC_ADDR         cluster.grpc_addr
+//	SEARCH_CLUSTER_REPLICATION_ROLE  cluster.replication_role
+//	SEARCH_CLUSTER_PRIMARY_ADDR      cluster.primary_addr
 //	SEARCH_CLUSTER_K8S_NAMESPACE     cluster.k8s_namespace
 //	SEARCH_CLUSTER_K8S_SERVICE       cluster.k8s_service
 //	SEARCH_CLUSTER_K8S_HTTP_PORT     cluster.k8s_http_port
 //	SEARCH_CLUSTER_K8S_GRPC_PORT     cluster.k8s_grpc_port
-//	SEARCH_STORAGE_PATH              storage.path
 //	SEARCH_STORAGE_DATA_DIR          storage.data_dir
 func ApplyEnv(cfg *Config) {
 	setStr := func(dst *string, key string) {
@@ -298,22 +301,23 @@ func ApplyEnv(cfg *Config) {
 	setInt(&cfg.Index.MemThresholdMB, "SEARCH_INDEX_MEM_THRESHOLD_MB")
 	setFloat(&cfg.Index.BM25K1, "SEARCH_INDEX_BM25_K1")
 	setFloat(&cfg.Index.BM25B, "SEARCH_INDEX_BM25_B")
-	setStr(&cfg.Index.SegmentCompression, "SEARCH_INDEX_SEGMENT_COMPRESSION")
 	setFloat(&cfg.Index.BloomFPRate, "SEARCH_INDEX_BLOOM_FP_RATE")
 	setStr(&cfg.Index.WarmupMode, "SEARCH_INDEX_WARMUP_MODE")
 	setInt(&cfg.Index.StartupMergeTarget, "SEARCH_INDEX_STARTUP_MERGE_TARGET")
 	setInt(&cfg.Index.VirtualNodesPerShard, "SEARCH_INDEX_VIRTUAL_NODES_PER_SHARD")
+	setInt(&cfg.Index.RefreshIntervalMs, "SEARCH_INDEX_REFRESH_INTERVAL_MS")
 	setStr(&cfg.Search.GlobalFusion, "SEARCH_SEARCH_GLOBAL_FUSION")
-	setStr(&cfg.Cluster.NodeID, "SEARCH_CLUSTER_NODE_ID")
+	setFloat(&cfg.Search.PhraseBoost, "SEARCH_SEARCH_PHRASE_BOOST")
 	setInt(&cfg.Cluster.TotalShards, "SEARCH_CLUSTER_TOTAL_SHARDS")
 	setIntSlice(&cfg.Cluster.LocalShards, "SEARCH_CLUSTER_LOCAL_SHARDS")
 	setStrSlice(&cfg.Cluster.BootstrapAddrs, "SEARCH_CLUSTER_BOOTSTRAP")
 
 	// Storage
-	setStr(&cfg.Storage.Path,    "SEARCH_STORAGE_PATH")
 	setStr(&cfg.Storage.DataDir, "SEARCH_STORAGE_DATA_DIR")
 
 	setStr(&cfg.Cluster.GRPCAddr, "SEARCH_CLUSTER_GRPC_ADDR")
+	setStr(&cfg.Cluster.ReplicationRole, "SEARCH_CLUSTER_REPLICATION_ROLE")
+	setStr(&cfg.Cluster.PrimaryAddr, "SEARCH_CLUSTER_PRIMARY_ADDR")
 	setStr(&cfg.Cluster.K8sNamespace, "SEARCH_CLUSTER_K8S_NAMESPACE")
 	setStr(&cfg.Cluster.K8sService, "SEARCH_CLUSTER_K8S_SERVICE")
 	setInt(&cfg.Cluster.K8sHTTPPort, "SEARCH_CLUSTER_K8S_HTTP_PORT")

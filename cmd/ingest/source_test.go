@@ -17,9 +17,9 @@ func TestDetectFormat(t *testing.T) {
 		{"corpus.ndjson", "auto", "jsonl"},
 		{"corpus.json", "auto", "json"},
 		{"corpus.csv", "auto", "csv"},
-		{"corpus.CSV", "auto", "csv"}, // case-insensitive
+		{"corpus.CSV", "auto", "csv"},       // case-insensitive
 		{"corpus.unknown", "auto", "jsonl"}, // fallback
-		{"corpus.json", "csv", "csv"}, // explicit override wins
+		{"corpus.json", "csv", "csv"},       // explicit override wins
 	}
 	for _, c := range cases {
 		got := detectFormat(c.path, c.explicit)

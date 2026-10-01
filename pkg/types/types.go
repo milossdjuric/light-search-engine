@@ -2,10 +2,10 @@ package types
 
 // Document is a text document with optional metadata.
 type Document struct {
-	ID       string
-	Text     string
-	Fields   map[string]string // named fields for BM25F (e.g. "title", "body")
-	Metadata map[string]string
+	ID       string            `json:"id"`
+	Text     string            `json:"text"`
+	Fields   map[string]string `json:"fields,omitempty"` // named fields for BM25F (e.g. "title", "body")
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ScoredDocument is a retrieval result with a score and rank.

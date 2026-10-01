@@ -4,21 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"search-eval-platform/internal/api"
-	"search-eval-platform/internal/retrieval/bm25"
-	"search-eval-platform/internal/search"
+	"search-eval-platform/internal/scoring"
+	"search-eval-platform/internal/shard"
 )
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	scorer := bm25.NewScorerOnly(1.2, 0.75)
-	policy := search.DefaultTieredMergePolicy()
-	shards, err := search.NewShardManager(2, t.TempDir(), scorer, policy)
+	scorer := scoring.NewBM25(1.2, 0.75)
+	policy := shard.DefaultTieredMergePolicy()
+	shards, err := shard.NewShardManager(2, t.TempDir(), scorer, policy)
 	if err != nil {
 		t.Fatalf("NewShardManager: %v", err)
 	}
@@ -427,9 +428,9 @@ func TestHandlerInternalIndexMissingFields(t *testing.T) {
 
 func newTestServerWithAPIKey(t *testing.T, apiKey string) *httptest.Server {
 	t.Helper()
-	scorer := bm25.NewScorerOnly(1.2, 0.75)
-	policy := search.DefaultTieredMergePolicy()
-	shards, err := search.NewShardManager(1, t.TempDir(), scorer, policy)
+	scorer := scoring.NewBM25(1.2, 0.75)
+	policy := shard.DefaultTieredMergePolicy()
+	shards, err := shard.NewShardManager(1, t.TempDir(), scorer, policy)
 	if err != nil {
 		t.Fatalf("NewShardManager: %v", err)
 	}
@@ -497,5 +498,46 @@ func TestHandlerRequireAuth(t *testing.T) {
 	healthResp.Body.Close()
 	if healthResp.StatusCode != http.StatusOK {
 		t.Errorf("health without auth: want 200, got %d", healthResp.StatusCode)
+	}
+}
+
+// search.default_top_k applies when the request has no top_k.
+func TestHandlerSearchUsesConfiguredDefaultTopK(t *testing.T) {
+	shards, err := shard.NewShardManager(1, t.TempDir(), scoring.NewBM25(1.2, 0.75), shard.DefaultTieredMergePolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shards.Start(); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	h := api.NewHandler(shards, "shard", 1.2, 0.75, "")
+	h.Register(mux)
+	h.SetDefaultTopK(2)
+	h.SetReady()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(func() { srv.Close(); shards.Close() })
+
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf(`{"id":"d%d","text":"shared term %d"}`, i, i)
+		resp, err := http.Post(srv.URL+"/index", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	resp, err := http.Get(srv.URL + "/search?q=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Results []json.RawMessage `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 2 {
+		t.Fatalf("got %d results without top_k, want the configured default 2", len(out.Results))
 	}
 }

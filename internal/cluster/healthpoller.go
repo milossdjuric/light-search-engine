@@ -23,7 +23,7 @@ type HealthPoller struct {
 //
 //   - nodes      – snapshot of shard NodeMeta (HTTPAddr used for /health call)
 //   - getBreaker – returns the CircuitBreaker for a given nodeID (same function
-//                  used by cluster.Client so the same breaker is shared)
+//     used by cluster.Client so the same breaker is shared)
 //   - interval   – how often to poll each node (recommended: 10s in production)
 func NewHealthPoller(
 	nodes []*NodeMeta,

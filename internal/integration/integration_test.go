@@ -16,17 +16,17 @@ import (
 	"time"
 
 	"search-eval-platform/internal/api"
-	"search-eval-platform/internal/retrieval/bm25"
-	"search-eval-platform/internal/search"
+	"search-eval-platform/internal/scoring"
+	"search-eval-platform/internal/shard"
 )
 
 // ── Test server setup ─────────────────────────────────────────────────────────
 
 func newIntegrationServer(t *testing.T, nShards int) *httptest.Server {
 	t.Helper()
-	scorer := bm25.NewScorerOnly(1.2, 0.75)
-	policy := search.DefaultTieredMergePolicy()
-	shards, err := search.NewShardManager(nShards, t.TempDir(), scorer, policy)
+	scorer := scoring.NewBM25(1.2, 0.75)
+	policy := shard.DefaultTieredMergePolicy()
+	shards, err := shard.NewShardManager(nShards, t.TempDir(), scorer, policy)
 	if err != nil {
 		t.Fatalf("NewShardManager: %v", err)
 	}
@@ -247,8 +247,10 @@ func TestCrossShardFanOut(t *testing.T) {
 	defer searchResp.Body.Close()
 
 	var result struct {
-		Results []struct{ DocID string `json:"doc_id"` } `json:"results"`
-		Total   int                                       `json:"total"`
+		Results []struct {
+			DocID string `json:"doc_id"`
+		} `json:"results"`
+		Total int `json:"total"`
 	}
 	mustDecodeJSON(t, searchResp.Body, &result)
 

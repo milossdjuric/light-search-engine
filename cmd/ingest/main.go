@@ -61,6 +61,7 @@ type Config struct {
 	BatchSize  int
 	Limit      int
 	Token      string
+	APIKey     string // search server API key (Authorization: Bearer) for write endpoints
 	Workers    int
 	Verbosity  int // 0=final only, 1=10s ticks, 2=per-batch
 	// Gen source
@@ -79,22 +80,23 @@ type sourceFile struct {
 // ── CLI flags ──────────────────────────────────────────────────────────────────
 
 var (
-	flagSource     = flag.String("source", "", "source: hf://owner/repo, gen://N, or local file path (required)")
-	flagHFConfig   = flag.String("config", "corpus", "HuggingFace dataset config/subset name")
-	flagHFSplit    = flag.String("split", "corpus", "HuggingFace dataset split name")
-	flagFormat     = flag.String("format", "auto", "file format: auto|parquet|jsonl|json|csv")
-	flagIDField    = flag.String("id-field", "_id", "field name for document ID")
-	flagTextFields = flag.String("text-fields", "title,text", "comma-separated fields joined as document text")
-	flagMetaFields = flag.String("meta-fields", "", "comma-separated fields to store as metadata")
-	flagServer     = flag.String("server", "http://localhost:8080", "search server base URL")
-	flagBatch      = flag.Int("batch", 10000, "documents per bulk POST request")
-	flagLimit      = flag.Int("limit", 0, "max documents to ingest (0 = all)")
-	flagToken      = flag.String("token", "", "HuggingFace API token (for private/gated datasets)")
-	flagWorkers    = flag.Int("workers", 2, "parallel HTTP workers for bulk POSTs")
-	flagVerbose     = flag.Bool("v", false, "10-second progress ticks (verbosity 1)")
-	flagVeryVerbose = flag.Bool("vv", false, "per-batch stats + 10s ticks (verbosity 2)")
-	flagGenSeed         = flag.Int64("gen-seed", 0, "random seed for gen:// sources (0 = time-based)")
-	flagParquetBatch    = flag.Int64("parquet-batch", 256*1024, "Arrow rows per batch when reading Parquet (larger = fewer decompression setup calls)")
+	flagSource       = flag.String("source", "", "source: hf://owner/repo, gen://N, or local file path (required)")
+	flagHFConfig     = flag.String("config", "corpus", "HuggingFace dataset config/subset name")
+	flagHFSplit      = flag.String("split", "corpus", "HuggingFace dataset split name")
+	flagFormat       = flag.String("format", "auto", "file format: auto|parquet|jsonl|json|csv")
+	flagIDField      = flag.String("id-field", "_id", "field name for document ID")
+	flagTextFields   = flag.String("text-fields", "title,text", "comma-separated fields joined as document text")
+	flagMetaFields   = flag.String("meta-fields", "", "comma-separated fields to store as metadata")
+	flagServer       = flag.String("server", "http://localhost:8080", "search server base URL")
+	flagBatch        = flag.Int("batch", 10000, "documents per bulk POST request")
+	flagLimit        = flag.Int("limit", 0, "max documents to ingest (0 = all)")
+	flagToken        = flag.String("token", "", "HuggingFace API token (for private/gated datasets)")
+	flagAPIKey       = flag.String("api-key", os.Getenv("SEARCH_SERVER_API_KEY"), "search server API key (default: $SEARCH_SERVER_API_KEY)")
+	flagWorkers      = flag.Int("workers", 2, "parallel HTTP workers for bulk POSTs")
+	flagVerbose      = flag.Bool("v", false, "10-second progress ticks (verbosity 1)")
+	flagVeryVerbose  = flag.Bool("vv", false, "per-batch stats + 10s ticks (verbosity 2)")
+	flagGenSeed      = flag.Int64("gen-seed", 0, "random seed for gen:// sources (0 = time-based)")
+	flagParquetBatch = flag.Int64("parquet-batch", 256*1024, "Arrow rows per batch when reading Parquet (larger = fewer decompression setup calls)")
 )
 
 func main() {
@@ -129,6 +131,7 @@ func main() {
 		BatchSize:  *flagBatch,
 		Limit:      *flagLimit,
 		Token:      *flagToken,
+		APIKey:     *flagAPIKey,
 		Workers:    *flagWorkers,
 		Verbosity: func() int {
 			if *flagVeryVerbose {
@@ -220,7 +223,7 @@ func run(cfg *Config) error {
 			defer wgWork.Done()
 			cli := &http.Client{Timeout: 120 * time.Second}
 			for batch := range batches {
-				ok, fail, nb := postBatch(cli, cfg.Server, batch)
+				ok, fail, nb := postBatch(cli, cfg.Server, cfg.APIKey, batch)
 				atomic.AddInt64(&indexed, int64(ok))
 				atomic.AddInt64(&failed, int64(fail))
 				atomic.AddInt64(&totalBytes, int64(nb))
@@ -292,31 +295,50 @@ func run(cfg *Config) error {
 	// Flush the server's in-memory buffer so the last partial chunk is persisted
 	// to disk immediately — without this, docs below the flush threshold would
 	// only be durably flushed on the next size-triggered flush or server shutdown.
-	flushResp, err := http.Post(cfg.Server+"/index/flush", "application/json", nil)
-	if err != nil {
+	if err := postServer(http.DefaultClient, cfg.Server, "/index/flush", cfg.APIKey); err != nil {
 		log.Printf("warning: flush after ingest failed: %v", err)
 	} else {
-		flushResp.Body.Close()
 		log.Printf("post-ingest flush complete")
 	}
 
 	// GC: recycle the builder temp files in the server's buffer pool.
 	// Temp files grow proportionally to flush size during ingest; after ingest
 	// is done, releasing the OS disk blocks keeps idle disk usage near zero.
-	gcResp, err := http.Post(cfg.Server+"/admin/gc", "application/json", nil)
-	if err != nil {
+	if err := postServer(http.DefaultClient, cfg.Server, "/admin/gc", cfg.APIKey); err != nil {
 		log.Printf("warning: post-ingest GC failed: %v", err)
 	} else {
-		gcResp.Body.Close()
 		log.Printf("post-ingest GC complete")
 	}
 
 	return nil
 }
 
+// postServer sends a bodyless POST to a server admin endpoint (flush, GC),
+// attaching the API key when set. A non-200 response is returned as an error.
+func postServer(cli *http.Client, server, path, apiKey string) error {
+	req, err := http.NewRequest("POST", server+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+	}
+	return nil
+}
+
 // postBatch sends one batch to POST /index/bulk.
 // Returns (indexed, failed, bytesSent) — bytesSent is the NDJSON payload size.
-func postBatch(cli *http.Client, server string, batch []Record) (int, int, int) {
+func postBatch(cli *http.Client, server, apiKey string, batch []Record) (int, int, int) {
 	var buf bytes.Buffer
 	for _, rec := range batch {
 		line, _ := json.Marshal(rec)
@@ -330,6 +352,9 @@ func postBatch(cli *http.Client, server string, batch []Record) (int, int, int) 
 		return 0, len(batch), bytesSent
 	}
 	req.Header.Set("Content-Type", "application/x-ndjson")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 
 	resp, err := cli.Do(req)
 	if err != nil {
